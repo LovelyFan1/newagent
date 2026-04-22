@@ -28,6 +28,8 @@ services:
     security_opt:
       - seccomp=unconfined
     privileged: true
+    env_file:
+      - .env
     environment:
       PYTHONPATH: /app
       APP_NAME: app_v2

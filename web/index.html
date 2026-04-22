@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>汽车金融分析智能体</title>
+<style>
+body{margin:0;overflow:hidden;background:black;font-family:Arial;}
+.title{position:fixed;left:30px;top:20px;color:#fff;font-size:18px;opacity:.85;z-index:20;}
+.chat-box{
+  position:fixed;right:15px;top:20px;bottom:20px;width:390px;z-index:20;
+  background:rgba(18,18,18,.55);backdrop-filter:blur(25px);-webkit-backdrop-filter:blur(25px);
+  border-radius:20px;border:1px solid rgba(255,255,255,.08);
+  box-shadow:0 0 40px rgba(255,255,255,.06), inset 0 0 20px rgba(255,255,255,.03);
+  display:flex;flex-direction:column;overflow:hidden;
+}
+.chat-header{
+  padding:14px 16px;color:#fff;border-bottom:1px solid rgba(255,255,255,.08);
+  display:flex;align-items:center;justify-content:space-between;gap:8px;
+}
+.chat-header .tools{display:flex;gap:6px;}
+.user-badge{font-size:12px;color:#d6b97a;opacity:.95;}
+.chat-header .tools button{
+  border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);
+  color:#ddd;font-size:11px;padding:4px 8px;border-radius:8px;cursor:pointer;
+}
+.chat-status{padding:6px 12px 0;min-height:16px;font-size:11px;color:#90f4bf;}
+.chat-error{padding:2px 12px 0;min-height:16px;font-size:11px;color:#ff9f9f;}
+.chat-content{flex:1;padding:12px;overflow:auto;color:#ddd;font-size:13px;line-height:1.6;}
+.chat-content{scrollbar-width:thin;scrollbar-color:rgba(214,185,122,.55) rgba(255,255,255,.06);}
+.chat-content::-webkit-scrollbar{width:10px;height:10px;}
+.chat-content::-webkit-scrollbar-track{background:rgba(255,255,255,.06);border-radius:999px;}
+.chat-content::-webkit-scrollbar-thumb{background:rgba(214,185,122,.55);border:2px solid rgba(18,18,18,.55);border-radius:999px;}
+.chat-content::-webkit-scrollbar-thumb:hover{background:rgba(214,185,122,.75);}
+.msg{margin:8px 0;white-space:pre-wrap;word-break:break-word;}
+.msg.user{text-align:right;color:#ffd28a;}
+.msg.bot{text-align:left;color:#fff;}
+.msg.sys{text-align:left;color:#9fc7ff;}
+.chat-input{display:flex;padding:12px;gap:10px;border-top:1px solid rgba(255,255,255,.08);}
+.chat-input.dragover{outline:2px dashed rgba(214,185,122,.85);outline-offset:-4px;background:rgba(214,185,122,.08);}
+.chat-input input{flex:1;background:rgba(255,255,255,.06);border:none;border-radius:12px;color:#fff;padding:12px;outline:none;}
+.chat-input button{width:42px;height:42px;border-radius:50%;border:none;background:linear-gradient(135deg,#d6b97a,#b8965c);color:#000;cursor:pointer;box-shadow:0 0 15px rgba(214,185,122,.6);}
+.chat-input .upload-btn{width:auto;height:42px;border-radius:12px;padding:0 12px;font-size:12px}
+.evidence-panel{
+  display:none;position:absolute;right:12px;bottom:74px;z-index:30;
+  width:360px;max-height:260px;background:rgba(10,10,15,.94);border:1px solid rgba(255,255,255,.14);
+  border-radius:12px;overflow:hidden;box-shadow:0 14px 30px rgba(0,0,0,.45);
+}
+.evidence-panel.open{display:flex;flex-direction:column;}
+.evidence-head{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.08);color:#d6b97a;font-size:11px;}
+.evidence-head button{border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);color:#ddd;font-size:11px;padding:3px 8px;border-radius:8px;cursor:pointer;}
+.evidence-body{padding:10px;font-size:11px;color:#ddd;white-space:pre-wrap;overflow:auto;max-height:210px;line-height:1.45;}
+.evidence-body{scrollbar-width:thin;scrollbar-color:rgba(214,185,122,.55) rgba(255,255,255,.06);}
+.evidence-body::-webkit-scrollbar{width:10px;height:10px;}
+.evidence-body::-webkit-scrollbar-track{background:rgba(255,255,255,.06);border-radius:999px;}
+.evidence-body::-webkit-scrollbar-thumb{background:rgba(214,185,122,.55);border:2px solid rgba(10,10,15,.94);border-radius:999px;}
+.evidence-body::-webkit-scrollbar-thumb:hover{background:rgba(214,185,122,.75);}
+#chartPanel{
+  position:fixed;left:-60%;top:0;bottom:0;width:60%;
+  /* 让背景“土星”透出：降低遮罩不透明度 */
+  background:rgba(10,10,15,.35);
+  backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);
+  color:#fff;padding:40px;box-sizing:border-box;transition:all 1s ease;opacity:0;z-index:15;
+}
+#chartPanel.show{left:0;opacity:1;}
+.chart-head{display:flex;align-items:center;justify-content:space-between;gap:12px;}
+.chart-head h2{margin:0;}
+.chart-tools{display:flex;gap:8px;align-items:center;}
+.chart-tools button{border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);color:#ddd;font-size:12px;padding:6px 10px;border-radius:10px;cursor:pointer;}
+.chart-tools button:hover{background:rgba(255,255,255,.09);}
+.chart-box{
+  margin-top:30px;padding:20px;border-radius:15px;
+  /* 图表卡片自身保持可读，但不完全挡住土星 */
+  background:rgba(8,8,12,.42);
+  border:1px solid rgba(255,255,255,.08);
+  box-shadow:0 0 30px rgba(0,0,0,.25);
+}
+#flowHint{
+  position:fixed;left:28%;top:17%;transform:translateX(-50%) scale(1);
+  z-index:16;pointer-events:none;opacity:0;
+  color:rgba(255,245,225,.95);font-size:14px;letter-spacing:.6px;
+  text-shadow:0 0 10px rgba(214,185,122,.55),0 0 24px rgba(214,185,122,.3);
+  transition:opacity .45s ease, transform .45s ease;
+}
+#flowHint.show{opacity:1;}
+#flowHint.fade-out{opacity:0;transform:translateX(-50%) scale(.88);}
+#flowHintText{display:inline-block;padding:8px 14px;border-radius:999px;border:1px solid rgba(255,255,255,.14);background:rgba(8,8,12,.46);}
+#flowHintText.flash{animation:flowFlash .9s ease;}
+@keyframes flowFlash{
+  0%{transform:scale(1);opacity:.75;filter:brightness(1);}
+  35%{transform:scale(.86);opacity:1;filter:brightness(1.26);}
+  100%{transform:scale(1);opacity:.95;filter:brightness(1);}
+}
+@media (max-width:900px){.chat-box{left:12px;right:12px;top:12px;bottom:12px;width:auto;}.evidence-panel{left:12px;right:12px;width:auto;}}
+</style>
+</head>
+<body>
+<div class="title">汽车金融分析智能体</div>
+<div id="flowHint" aria-live="polite" aria-atomic="true"><span id="flowHintText">分析准备中...</span></div>
+<div id="chartPanel">
+  <div class="chart-head">
+    <h2>数据分析大屏</h2>
+    <div class="chart-tools">
+      <button type="button" id="collapseChartBtn" aria-label="收起左侧大屏">收起</button>
+    </div>
+  </div>
+  <div id="chartContent">
+    <!-- ECharts 挂载容器：投资意图用仪表盘 + 散点图 -->
+    <div id="gaugeChart" class="chart-box" style="height:260px;"></div>
+    <div id="scatterChart" class="chart-box" style="height:340px;"></div>
+    <!-- 文本/简易图表兜底区域 -->
+    <div id="chartTextBlocks"></div>
+  </div>
+</div>
+<div class="chat-box">
+  <div class="chat-header">
+    <span>AI 助手</span>
+    <span id="currentUser" class="user-badge"></span>
+    <div class="tools">
+      <button type="button" id="toggleChartBtn">左侧大屏</button>
+      <button type="button" id="newSessionBtn">新建会话</button>
+      <button type="button" id="btnEvidence">证据</button>
+      <button type="button" id="logoutBtn">退出</button>
+    </div>
+  </div>
+  <div id="agentStatus" class="chat-status"></div>
+  <div id="agentError" class="chat-error"></div>
+  <div class="chat-content" id="chat"></div>
+  <div class="evidence-panel" id="evidencePanel">
+    <div class="evidence-head"><span>可追溯证据</span><button type="button" id="refreshSourcesBtn">刷新</button></div>
+    <div class="evidence-body" id="sourcePanel">暂无证据</div>
+  </div>
+  <div class="chat-input">
+    <button id="uploadBtn" class="upload-btn" type="button">上传文件</button>
+    <input id="input" placeholder="猜你想问：比亚迪近一年销量如何？蔚来近三年财报怎么样？" autocomplete="off">
+    <button id="sendBtn" type="button">↑</button>
+  </div>
+  <input id="fileInput" type="file" style="display:none" accept=".pdf,.doc,.docx,.xlsx,.xls,.csv,.txt">
+  <div style="padding:0 12px 10px;color:#9fc7ff;font-size:11px;">支持拖拽 Word/Excel/CSV/TXT/PDF 到输入框区域上传</div>
+  <div style="padding:0 12px 12px;"><button id="downloadPdfBtn" type="button" style="display:none;border:1px solid rgba(255,255,255,.2);background:rgba(255,255,255,.08);color:#fff;padding:8px 10px;border-radius:8px;cursor:pointer;">📄 下载PDF报告</button></div>
+</div>
+<script src="./vendor/three.min.js?v=20260422"></script>
+<script src="./vendor/echarts.min.js?v=20260422"></script>
+<script src="./js/galaxy.js?v=20260422_1"></script>
+<script>window.API_BASE_URL = window.API_BASE_URL || '';</script>
+<script src="./js/api-client.js?v=20260423_1"></script>
+<script src="./js/app.js?v=20260422_1"></script>
+</body>
+</html>

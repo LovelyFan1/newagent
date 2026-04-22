@@ -23,26 +23,33 @@ class LLMResult:
 
 class LLMGateway:
     def __init__(self, *, timeout_s: float = 30.0, max_retries: int = 3):
-        self.timeout_s = timeout_s
-        self.max_retries = max_retries
+        env_timeout = os.environ.get("LLM_TIMEOUT_S")
+        env_retries = os.environ.get("LLM_MAX_RETRIES")
+        self.timeout_s = float(env_timeout) if env_timeout else timeout_s
+        self.max_retries = int(env_retries) if env_retries else max_retries
+        self.model = os.environ.get("LLM_MODEL") or os.environ.get("LLM_MODEL_NAME") or "moonshot-v1-8k"
+        self.base_url = os.environ.get("LLM_BASE_URL", "").strip() or None
         api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("LLM_API_KEY")
         self._enabled = bool(api_key and api_key.strip())
-        self._client = AsyncOpenAI(api_key=api_key) if self._enabled else None
+        self._client = AsyncOpenAI(api_key=api_key, base_url=self.base_url) if self._enabled else None
+        if not self._enabled:
+            logger.warning("LLM disabled: missing OPENAI_API_KEY/LLM_API_KEY; will use offline reports.")
 
     @property
     def enabled(self) -> bool:
         return self._enabled
 
-    async def chat(self, *, system: str, user: str, model: str = "gpt-4o-mini", temperature: float = 0.2) -> LLMResult:
+    async def chat(self, *, system: str, user: str, model: str | None = None, temperature: float = 0.2) -> LLMResult:
         if not self._client:
             raise RuntimeError("LLM not configured (OPENAI_API_KEY/LLM_API_KEY is missing)")
+        model_name = model or self.model
 
         last_err: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
             try:
                 resp = await asyncio.wait_for(
                     self._client.chat.completions.create(
-                        model=model,
+                        model=model_name,
                         temperature=temperature,
                         messages=[
                             {"role": "system", "content": system},
@@ -55,7 +62,7 @@ class LLMGateway:
                 usage = getattr(resp, "usage", None)
                 result = LLMResult(
                     content=content,
-                    model=model,
+                    model=model_name,
                     prompt_tokens=getattr(usage, "prompt_tokens", None) if usage else None,
                     completion_tokens=getattr(usage, "completion_tokens", None) if usage else None,
                     total_tokens=getattr(usage, "total_tokens", None) if usage else None,
@@ -63,7 +70,7 @@ class LLMGateway:
                 if result.total_tokens is not None:
                     logger.info(
                         "llm_call model=%s tokens=%s (prompt=%s completion=%s)",
-                        model,
+                        model_name,
                         result.total_tokens,
                         result.prompt_tokens,
                         result.completion_tokens,

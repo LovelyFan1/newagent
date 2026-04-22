@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+<title>登录 - 汽车金融分析智能体</title>
+<style>
+body{
+    margin:0;
+    overflow:hidden;
+    background:#000;
+    font-family:"Microsoft Yahei","Segoe UI",Arial,sans-serif;
+}
+
+#bg{
+    position:fixed;
+    width:100%;
+    height:100%;
+    top:0;
+    left:0;
+    z-index:-1;
+}
+
+.title{
+    position:absolute;
+    top:40px;
+    left:50%;
+    transform:translateX(-50%);
+    color:#fff;
+    font-size:22px;
+    letter-spacing:2px;
+    opacity:0.9;
+    text-align:center;
+    width:100%;
+    padding:0 16px;
+    box-sizing:border-box;
+}
+
+.login-box{
+    position:absolute;
+    top:50%;
+    left:50%;
+    transform:translate(-50%,-50%);
+
+    width:min(360px, calc(100vw - 32px));
+    padding:40px 32px;
+
+    background:rgba(18,18,18,0.6);
+    backdrop-filter:blur(25px);
+    -webkit-backdrop-filter:blur(25px);
+
+    border-radius:20px;
+    border:1px solid rgba(255,255,255,0.08);
+
+    box-shadow:
+        0 0 40px rgba(255,255,255,0.05),
+        inset 0 0 20px rgba(255,255,255,0.03);
+
+    display:flex;
+    flex-direction:column;
+    gap:20px;
+}
+
+.input-box{
+    display:flex;
+    flex-direction:column;
+    gap:6px;
+}
+
+.input-box label{
+    color:#aaa;
+    font-size:13px;
+}
+.hint{
+    color:rgba(255,255,255,0.45);
+    font-size:12px;
+    margin-top:6px;
+    line-height:1.35;
+}
+
+.input-box input{
+    padding:12px;
+    border-radius:12px;
+    border:none;
+    outline:none;
+
+    background:rgba(255,255,255,0.06);
+    color:#fff;
+
+    transition:all 0.3s;
+    font-size:15px;
+}
+
+.input-box input::placeholder{
+    color:rgba(255,255,255,0.35);
+}
+
+.input-box input:focus{
+    box-shadow:0 0 10px rgba(214,185,122,0.6);
+    background:rgba(255,255,255,0.1);
+}
+
+.login-btn{
+    margin-top:10px;
+    height:45px;
+    border:none;
+    border-radius:25px;
+
+    background:linear-gradient(135deg,#d6b97a,#b8965c);
+    color:#000;
+    font-size:15px;
+    cursor:pointer;
+
+    box-shadow:0 0 20px rgba(214,185,122,0.6);
+
+    transition:all 0.3s;
+}
+.register-btn{
+    height:42px;
+    border:1px solid rgba(255,255,255,.2);
+    border-radius:25px;
+    background:rgba(255,255,255,0.06);
+    color:#fff;
+    font-size:14px;
+    cursor:pointer;
+}
+.mode-row{
+    display:flex;
+    gap:10px;
+    margin-top:6px;
+}
+.mode-row button{
+    flex:1;
+    height:40px;
+    border-radius:999px;
+    cursor:pointer;
+    border:1px solid rgba(255,255,255,.16);
+    background:rgba(255,255,255,.04);
+    color:#d1d5db;
+    font-size:13px;
+}
+.mode-row button.active{
+    background:linear-gradient(135deg,#d6b97a,#b8965c);
+    color:#000;
+    border:none;
+    box-shadow:0 0 16px rgba(214,185,122,0.35);
+}
+
+.login-btn:hover:not(:disabled){
+    transform:translateY(-2px) scale(1.03);
+    box-shadow:0 0 30px rgba(214,185,122,0.9);
+}
+
+.login-btn:disabled{
+    opacity:0.65;
+    cursor:not-allowed;
+}
+
+.footer{
+    text-align:center;
+    color:#777;
+    font-size:12px;
+    margin-top:10px;
+}
+
+#error{
+    color:#ff6b6b;
+    font-size:12px;
+    text-align:center;
+    display:none;
+    line-height:1.4;
+}
+
+#success{
+    color:#7bed9f;
+    font-size:12px;
+    text-align:center;
+    display:none;
+    line-height:1.4;
+}
+
+</style>
+</head>
+<body>
+
+<canvas id="bg"></canvas>
+
+<div class="title">汽车金融分析智能体</div>
+
+<div class="login-box">
+
+    <div class="mode-row">
+        <button id="modeLogin" type="button" class="active">登录</button>
+        <button id="modeRegister" type="button">注册</button>
+    </div>
+
+    <div class="input-box">
+        <label id="usernameLabel">账号</label>
+        <input id="username" type="text" placeholder="请输入账号（如 123 / user@xx.com）" autocomplete="username">
+        <div class="hint" id="usernameHint">提示：不含 @ 的账号会自动补全为邮箱（例如输入 123 → 123@example.com）</div>
+    </div>
+
+    <div class="input-box">
+        <label id="passwordLabel">密码</label>
+        <input id="password" type="password" placeholder="请输入密码（至少 8 位，如 DemoPass123）" autocomplete="current-password">
+        <div class="hint" id="passwordHint">注册要求：密码至少 8 位；建议包含大小写字母与数字。</div>
+    </div>
+
+    <div id="error"></div>
+    <div id="success"></div>
+
+    <button class="login-btn" id="loginBtn" type="button">登录</button>
+    <button class="register-btn" id="registerBtn" type="button" style="display:none;">创建账号</button>
+
+    <p id="quickEntry" style="display:none;text-align:center;margin:0;">
+      <a href="./index.html" id="quickEntryLink" style="color:rgba(212,175,55,0.75);font-size:12px;text-decoration:none;border-bottom:1px solid rgba(212,175,55,0.35);">已登录，直接进入智能体</a>
+    </p>
+
+    <div class="footer">AI Risk Analysis System</div>
+</div>
+
+<script>window.API_BASE_URL = window.API_BASE_URL || '';</script>
+<script src="./js/api-client.js?v=20260423_1"></script>
+<script src="./js/login.js?v=20260423_1"></script>
+</body>
+</html>

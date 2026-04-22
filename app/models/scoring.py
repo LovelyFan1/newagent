@@ -19,5 +19,6 @@ class ScoringResult(Base):
     dimension_scores: Mapped[dict] = mapped_column(JSONB, nullable=False)
     total_score: Mapped[float] = mapped_column(Float, nullable=False)
     rating: Mapped[str] = mapped_column(String(8), nullable=False)
+    data_hash: Mapped[str | None] = mapped_column(String(32), nullable=True, comment="原始数据MD5指纹")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from fastapi import FastAPI
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.api import api_router
 from app.api.exceptions import install_exception_handlers
@@ -14,6 +16,13 @@ def create_app() -> FastAPI:
     app = FastAPI(title=settings.app_name)
     install_exception_handlers(app)
     app.include_router(api_router)
+
+    # static web (single-port demo): serve /web/*, and redirect "/" to login page.
+    app.mount("/web", StaticFiles(directory="web", html=True), name="web")
+
+    @app.get("/", include_in_schema=False)
+    async def _root():
+        return RedirectResponse(url="/web/login.html")
 
     @app.on_event("startup")
     async def _ensure_scoring_results_table() -> None:
@@ -49,6 +58,7 @@ def create_app() -> FastAPI:
                     dimension_scores JSONB NOT NULL,
                     total_score DOUBLE PRECISION NOT NULL,
                     rating VARCHAR(8) NOT NULL,
+                    data_hash VARCHAR(32) NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 );
                 """
@@ -58,6 +68,9 @@ def create_app() -> FastAPI:
             )
             await conn.exec_driver_sql(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_scoring_results_stock_code_year ON public.scoring_results (stock_code, year);"
+            )
+            await conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_scoring_results_data_hash ON public.scoring_results (data_hash);"
             )
     return app
 

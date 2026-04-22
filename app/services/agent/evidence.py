@@ -13,9 +13,11 @@ from app.services.vector_retriever import vector_retriever
 
 class Evidence(BaseModel):
     evidence_id: str
+    source_type: str | None = None
     source: str
     title: str
     excerpt: str
+    url_or_path: str | None = None
     confidence: float = Field(ge=0.0, le=1.0)
 
 
@@ -66,9 +68,11 @@ class EvidenceRetriever:
             out.append(
                 Evidence(
                     evidence_id=new_evidence_id("kb"),
+                    source_type="knowledge",
                     source="knowledge_base",
                     title=d.title or f"Document #{d.id}",
                     excerpt=safe_text(d.content, 560),
+                    url_or_path=d.source,
                     confidence=max(0.1, min(0.95, d.score)),
                 )
             )
@@ -93,9 +97,11 @@ class EvidenceRetriever:
         return [
             Evidence(
                 evidence_id=new_evidence_id("local_ind"),
+                source_type="local",
                 source="local_indicator_engine",
                 title=f"{enterprise} {year} 指标引擎结果",
                 excerpt=safe_text(excerpt, 520),
+                url_or_path=None,
                 confidence=0.85,
             )
         ]
@@ -114,9 +120,11 @@ class EvidenceRetriever:
         return [
             Evidence(
                 evidence_id=new_evidence_id("score"),
+                source_type="local",
                 source="local_scoring_service",
                 title=f"{enterprise} {year} 风险评分结果",
                 excerpt=safe_text(excerpt, 520),
+                url_or_path=None,
                 confidence=0.9,
             )
         ]

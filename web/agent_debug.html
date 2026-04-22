@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Agent 接口临时调试页</title>
+  <style>
+    body { font-family: Arial, sans-serif; background:#f5f7fb; margin:0; color:#1f2937; }
+    .wrap { max-width: 980px; margin: 24px auto; padding: 0 16px; }
+    .card { background:#fff; border:1px solid #e5e7eb; border-radius:10px; padding:16px; margin-bottom:12px; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:10px; }
+    input, select, textarea { border:1px solid #d1d5db; border-radius:6px; padding:8px; font-size:14px; }
+    input, select { min-width: 160px; }
+    textarea { width:100%; min-height:70px; resize:vertical; }
+    button { border:none; background:#1d4ed8; color:#fff; padding:8px 12px; border-radius:6px; cursor:pointer; }
+    button:disabled { background:#93c5fd; cursor:not-allowed; }
+    .muted { color:#6b7280; font-size:13px; margin: 6px 0 10px; }
+    .ok { color:#065f46; }
+    .err { color:#b91c1c; }
+    pre { background:#0f172a; color:#e2e8f0; border-radius:8px; padding:12px; overflow:auto; max-height:480px; }
+    .pill { display:inline-block; font-size:12px; padding:2px 8px; border-radius:999px; background:#e5e7eb; margin-left:6px; }
+    .chart-grid { display:grid; grid-template-columns: repeat(2, minmax(260px, 1fr)); gap:10px; }
+    .chart-box {
+      background:#0b1220; color:#e5e7eb; border:1px solid #1f2937; border-radius:10px; padding:12px;
+    }
+    .chart-box h4 { margin:0 0 8px 0; font-size:14px; }
+    .bar-track { height:8px; background:#1e293b; border-radius:99px; overflow:hidden; }
+    .bar-fill { height:100%; border-radius:99px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h2>Agent 临时调试页 <span class="pill">query/report/sources</span></h2>
+    <p class="muted">用于本地联调：输入问题，点按钮，直接看 JSON 返回。</p>
+
+    <div class="card">
+      <h3>1) Query</h3>
+      <div class="row">
+        <input id="timeRange" placeholder="time_range，如 近1年" value="近1年" />
+        <select id="outputMode">
+          <option value="answer">answer</option>
+          <option value="report">report</option>
+        </select>
+        <input id="sessionId" placeholder="session_id（可空，自动生成）" />
+      </div>
+      <textarea id="question">请对比比亚迪和理想近1年的风险机会</textarea>
+      <div class="row">
+        <button id="btnQuery">调用 /api/v1/agent/query</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>2) Report</h3>
+      <div class="row">
+        <select id="reportTemplate">
+          <option value="investor">investor</option>
+          <option value="manager">manager</option>
+        </select>
+        <button id="btnReport">调用 /api/v1/agent/report</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>3) Sources</h3>
+      <div class="row">
+        <button id="btnSources">调用 /api/v1/agent/sources/{session_id}</button>
+      </div>
+      <div class="muted">会自动用当前输入框里的 session_id（query 成功后会自动回填）。</div>
+    </div>
+
+    <div class="card">
+      <div id="status" class="muted">状态：待测试</div>
+      <pre id="output">{}</pre>
+    </div>
+    <div class="card">
+      <h3>4) Charts Preview</h3>
+      <div id="chartMount" class="chart-grid"></div>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const output = $("output");
+    const statusEl = $("status");
+    const chartMount = $("chartMount");
+    const CHART_THEME = {
+      primary: "#4f8cff",
+      secondary: "#34d399",
+      accent: "#f59e0b",
+      danger: "#ef4444",
+      muted: "#94a3b8"
+    };
+    let lastChartState = null;
+
+    function setStatus(msg, isError = false) {
+      statusEl.textContent = "状态：" + msg;
+      statusEl.className = isError ? "err" : "ok";
+    }
+
+    function showJson(data) {
+      output.textContent = JSON.stringify(data, null, 2);
+    }
+
+    function esc(s) {
+      return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function normalizeCharts(charts) {
+      const safe = charts && typeof charts === "object" ? charts : {};
+      const radar = safe.radar && typeof safe.radar === "object" ? safe.radar : {};
+      const bar = safe.bar && typeof safe.bar === "object" ? safe.bar : {};
+      const line = safe.line && typeof safe.line === "object" ? safe.line : {};
+      const gauge = safe.gauge && typeof safe.gauge === "object" ? safe.gauge : {};
+      return {
+        radar: { indicators: Array.isArray(radar.indicators) ? radar.indicators : [], series: Array.isArray(radar.series) ? radar.series : [] },
+        bar: { categories: Array.isArray(bar.categories) ? bar.categories : [], series: Array.isArray(bar.series) ? bar.series : [] },
+        line: { categories: Array.isArray(line.categories) ? line.categories : [], series: Array.isArray(line.series) ? line.series : [] },
+        gauge: { value: Number.isFinite(Number(gauge.value)) ? Number(gauge.value) : 0 }
+      };
+    }
+
+    function renderNoDataPlaceholder(title, desc) {
+      return '<div class="chart-box"><h4 style="color:' + CHART_THEME.muted + ';">' + esc(title) + '</h4><div>' + esc(desc || "暂无可展示数据") + '</div></div>';
+    }
+
+    function renderGauge(value) {
+      const score = Math.max(0, Math.min(100, Number(value) || 0));
+      const color = score >= 75 ? CHART_THEME.secondary : score >= 50 ? CHART_THEME.accent : CHART_THEME.danger;
+      return (
+        '<div class="chart-box"><h4>仪表盘评分</h4>' +
+        '<div style="font-size:30px;font-weight:700;color:' + color + ';">' + score.toFixed(1) + '</div>' +
+        '<div class="bar-track"><div class="bar-fill" style="width:' + score + '%;background:' + color + ';"></div></div></div>'
+      );
+    }
+
+    function renderRadarSummary(indicators, values) {
+      if (!indicators.length || !values.length) return renderNoDataPlaceholder("雷达图", "暂无能力维度评分");
+      const rows = indicators.map(function (it, i) {
+        const name = typeof it === "object" ? it.name : String(it);
+        return '<div style="display:flex;justify-content:space-between;margin:6px 0;"><span>' + esc(name) + '</span><span style="color:' + CHART_THEME.secondary + ';">' + (Number(values[i]) || 0) + '</span></div>';
+      }).join("");
+      return '<div class="chart-box"><h4>雷达维度</h4>' + rows + '</div>';
+    }
+
+    function renderSimpleBars(categories, values) {
+      if (!categories.length || !values.length) return renderNoDataPlaceholder("柱状图", "当前查询未返回可比较维度");
+      const maxVal = Math.max.apply(null, values.map(function (v) { return Number(v) || 0; }));
+      const rows = categories.map(function (c, i) {
+        const v = Number(values[i]) || 0;
+        const width = maxVal > 0 ? Math.max(5, Math.round((v / maxVal) * 100)) : 5;
+        return (
+          '<div style="margin:8px 0;"><div style="display:flex;justify-content:space-between;font-size:12px;"><span>' + esc(c) +
+          '</span><span>' + v + '</span></div><div class="bar-track"><div class="bar-fill" style="width:' + width + '%;background:' + CHART_THEME.primary + ';"></div></div></div>'
+        );
+      }).join("");
+      return '<div class="chart-box"><h4>证据来源分布</h4>' + rows + '</div>';
+    }
+
+    function renderLineSummary(categories, values) {
+      if (!categories.length || !values.length) return renderNoDataPlaceholder("趋势图", "暂无时间序列数据");
+      const txt = categories.map(function (c, i) { return esc(c) + ": " + (Number(values[i]) || 0); }).join(" | ");
+      return '<div class="chart-box"><h4>时间趋势</h4><div>' + txt + '</div></div>';
+    }
+
+    function renderCharts(charts) {
+      const normalized = normalizeCharts(charts);
+      lastChartState = normalized;
+      const radarSeries = normalized.radar.series[0] || {};
+      const barSeries = normalized.bar.series[0] || {};
+      const lineSeries = normalized.line.series[0] || {};
+      chartMount.innerHTML = [
+        renderGauge(normalized.gauge.value),
+        renderRadarSummary(normalized.radar.indicators, Array.isArray(radarSeries.value) ? radarSeries.value : []),
+        renderSimpleBars(normalized.bar.categories, Array.isArray(barSeries.data) ? barSeries.data : []),
+        renderLineSummary(normalized.line.categories, Array.isArray(lineSeries.data) ? lineSeries.data : [])
+      ].join("");
+    }
+
+    async function postJson(url, payload) {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || data.message || "请求失败");
+      }
+      return data;
+    }
+
+    function buildBasePayload() {
+      const question = $("question").value.trim();
+      const timeRange = $("timeRange").value.trim();
+      const outputMode = $("outputMode").value;
+      const sessionId = $("sessionId").value.trim();
+      return {
+        question,
+        time_range: timeRange || null,
+        output_mode: outputMode,
+        session_id: sessionId || null
+      };
+    }
+
+    $("btnQuery").onclick = async () => {
+      try {
+        setStatus("query 请求中...");
+        const payload = buildBasePayload();
+        const data = await postJson("/api/v1/agent/query", payload);
+        if (data.session_id) $("sessionId").value = data.session_id;
+        setStatus("query 成功");
+        showJson(data);
+        renderCharts(data.charts || {});
+      } catch (e) {
+        setStatus("query 失败：" + e.message, true);
+      }
+    };
+
+    $("btnReport").onclick = async () => {
+      try {
+        setStatus("report 请求中...");
+        const base = buildBasePayload();
+        const payload = {
+          question: base.question,
+          time_range: base.time_range,
+          report_template: $("reportTemplate").value,
+          session_id: base.session_id
+        };
+        const data = await postJson("/api/v1/agent/report", payload);
+        if (data.session_id) $("sessionId").value = data.session_id;
+        setStatus("report 成功");
+        showJson(data);
+      } catch (e) {
+        setStatus("report 失败：" + e.message, true);
+      }
+    };
+
+    $("btnSources").onclick = async () => {
+      try {
+        const sessionId = $("sessionId").value.trim();
+        if (!sessionId) {
+          throw new Error("请先有 session_id（先调用 query）");
+        }
+        setStatus("sources 请求中...");
+        const res = await fetch("/api/v1/agent/sources/" + encodeURIComponent(sessionId));
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || "请求失败");
+        }
+        setStatus("sources 成功");
+        showJson(data);
+      } catch (e) {
+        setStatus("sources 失败：" + e.message, true);
+      }
+    };
+
+    window.addEventListener("resize", () => {
+      if (!lastChartState) return;
+      window.requestAnimationFrame(() => renderCharts(lastChartState));
+    });
+  </script>
+</body>
+</html>

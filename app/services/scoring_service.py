@@ -5,8 +5,16 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+import hashlib
+import json
 from typing import Any, Dict, Optional
 
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.scoring import ScoringResult
 from app.services.indicator_calc import calculate_indicators
 
 
@@ -48,6 +56,23 @@ INDICATOR_WEIGHTS = {
         "guarantee_ratio": 0.25,
         "recall_density": 0.30,
     },
+}
+
+DIMENSION_INDICATORS = {
+    "financial_health": [
+        "current_ratio",
+        "quick_ratio",
+        "cashflow_coverage",
+        "debt_ebitda_ratio",
+        "roe",
+        "operating_profit_margin",
+        "asset_turnover",
+        "inventory_turnover",
+        "receivables_turnover",
+    ],
+    "industry_position": ["nev_penetration", "nev_gap", "sales_deviation_rate", "revenue_per_vehicle"],
+    "legal_risk": ["execution_ratio", "dishonest_count", "commercial_paper_default"],
+    "operation": ["rd_capitalization_ratio", "free_cashflow", "guarantee_ratio", "recall_density"],
 }
 
 # 指标阈值（用于计算单指标得分 0-100）
@@ -126,12 +151,49 @@ def score_indicator(key: str, raw_val) -> float:
 
 
 class ScoringService:
-    async def calculate_score(self, stock_code: str, year: int) -> Optional[Dict[str, Any]]:
+    async def get_raw_data(self, stock_code: str, year: int) -> Optional[Dict[str, Any]]:
         try:
-            ent_data = await calculate_indicators(stock_code, year)
+            return await calculate_indicators(stock_code, year)
         except ValueError:
             return None
-        indicators = ent_data["indicators"]
+
+    def calculate_score_from_raw_data(self, *, raw_data: Dict[str, Any], year: int) -> Dict[str, Any]:
+        indicators = raw_data["indicators"]
+        # Prefer completeness/weights from indicator engine if present; otherwise compute here.
+        scores_meta = raw_data.get("scores") if isinstance(raw_data.get("scores"), dict) else {}
+        completeness = scores_meta.get("completeness") if isinstance(scores_meta.get("completeness"), dict) else None
+        effective_weights = scores_meta.get("effective_weights") if isinstance(scores_meta.get("effective_weights"), dict) else None
+
+        if completeness is None:
+            completeness = {}
+            for dim, inds in DIMENSION_INDICATORS.items():
+                if not inds:
+                    completeness[dim] = 0.0
+                    continue
+                dim_data = indicators.get(dim, {}) if isinstance(indicators.get(dim), dict) else {}
+                filled = 0
+                for ind in inds:
+                    v = dim_data.get(ind)
+                    if v is None:
+                        continue
+                    if isinstance(v, str) and v.strip().upper() == "N/A":
+                        continue
+                    filled += 1
+                completeness[dim] = filled / len(inds)
+
+        if effective_weights is None:
+            base_weights = dict(DIMENSION_WEIGHTS)
+            valid_dims = {k for k, v in completeness.items() if float(v or 0.0) > 0.3}
+            if valid_dims:
+                total_w = sum(base_weights.get(k, 0.0) for k in valid_dims) or 0.0
+                if total_w > 0:
+                    effective_weights = {
+                        k: (round(base_weights[k] / total_w, 4) if k in valid_dims else 0.0) for k in base_weights
+                    }
+                else:
+                    effective_weights = base_weights
+            else:
+                effective_weights = base_weights
 
         dimension_scores: dict[str, float] = {}
         indicator_scores: dict[str, float] = {}
@@ -163,7 +225,7 @@ class ScoringService:
 
             dimension_scores[dim_key] = round(dim_score / total_w, 1) if total_w > 0 else 50.0
 
-        total_score = sum(dimension_scores[d] * w for d, w in DIMENSION_WEIGHTS.items())
+        total_score = sum(float(dimension_scores.get(d, 50.0)) * float(effective_weights.get(d, 0.0)) for d in DIMENSION_WEIGHTS)
 
         if total_score >= 80:
             rating, desc = "A", "经营优秀"
@@ -174,16 +236,89 @@ class ScoringService:
         else:
             rating, desc = "D", "经营风险"
 
+        dimension_scores_detail = {
+            dim: {
+                "score": round(float(score), 2),
+                "weight": float(effective_weights.get(dim, 0.0) or 0.0),
+                "completeness": float(completeness.get(dim, 0.0) or 0.0),
+                "warning": None
+                if float(completeness.get(dim, 0.0) or 0.0) > 0.3
+                else "数据完整度不足，分数参考价值有限",
+            }
+            for dim, score in dimension_scores.items()
+        }
+
+        confidence = (
+            round(sum(float(v or 0.0) for v in completeness.values()) / len(completeness), 2) if completeness else 0.0
+        )
+
         return {
-            "stock_code": ent_data["stock_code"],
-            "stock_name": ent_data["enterprise_name"],
+            "stock_code": raw_data.get("stock_code"),
             "year": year,
-            "total_score": round(total_score, 1),
+            "total_score": round(float(total_score), 2),
             "rating": rating,
+            "dimension_scores": dimension_scores_detail,
+            "effective_weights": effective_weights,
+            "confidence": confidence,
+            "updated_at": datetime.now().isoformat(),
+            # Keep extra info for debugging/compat if callers still need it
             "rating_desc": desc,
-            "dimension_scores": dimension_scores,
             "indicator_scores": indicator_scores,
         }
+
+    async def calculate(self, db: AsyncSession, stock_code: str, year: int, force: bool = False) -> Optional[Dict[str, Any]]:
+        raw_data = await self.get_raw_data(stock_code, year)
+        if raw_data is None:
+            return None
+
+        raw_data_str = json.dumps(raw_data, sort_keys=True, default=str)
+        data_hash = hashlib.md5(raw_data_str.encode()).hexdigest()
+
+        existing = (
+            await db.execute(select(ScoringResult).where(ScoringResult.stock_code == stock_code, ScoringResult.year == year))
+        ).scalar_one_or_none()
+
+        if (not force) and existing is not None and existing.data_hash == data_hash:
+            # Return a fresh response (includes confidence/effective_weights) but keep cache as source of truth.
+            return self.calculate_score_from_raw_data(raw_data=raw_data, year=year)
+
+        result = self.calculate_score_from_raw_data(raw_data=raw_data, year=year)
+
+        if existing is not None:
+            existing.stock_code = stock_code
+            existing.stock_name = str(raw_data.get("enterprise_name") or stock_code)
+            existing.year = year
+            existing.dimension_scores = result["dimension_scores"]
+            existing.total_score = float(result["total_score"])
+            existing.rating = str(result["rating"])
+            existing.data_hash = data_hash
+            try:
+                await db.commit()
+            except IntegrityError:
+                await db.rollback()
+        else:
+            record = ScoringResult(
+                stock_code=stock_code,
+                stock_name=str(raw_data.get("enterprise_name") or stock_code),
+                year=year,
+                dimension_scores=result["dimension_scores"],
+                total_score=float(result["total_score"]),
+                rating=str(result["rating"]),
+                data_hash=data_hash,
+            )
+            db.add(record)
+            try:
+                await db.commit()
+            except IntegrityError:
+                # concurrent requests may insert same (stock_code, year)
+                await db.rollback()
+        return result
+
+    async def calculate_score(self, stock_code: str, year: int) -> Optional[Dict[str, Any]]:
+        raw_data = await self.get_raw_data(stock_code, year)
+        if raw_data is None:
+            return None
+        return self.calculate_score_from_raw_data(raw_data=raw_data, year=year)
 
 
 scoring_service = ScoringService()

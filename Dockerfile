@@ -12,6 +12,7 @@ COPY tests /app/tests
 COPY pytest.ini /app/pytest.ini
 COPY scripts /app/scripts
 COPY data /app/data
+COPY web /app/web
 
 ENV PYTHONUNBUFFERED=1
 

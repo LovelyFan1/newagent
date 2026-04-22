@@ -48,6 +48,23 @@ INDICATOR_WEIGHTS = {
     },
 }
 
+DIMENSION_INDICATORS = {
+    "financial_health": [
+        "current_ratio",
+        "quick_ratio",
+        "cashflow_coverage",
+        "debt_ebitda_ratio",
+        "roe",
+        "operating_profit_margin",
+        "asset_turnover",
+        "inventory_turnover",
+        "receivables_turnover",
+    ],
+    "industry_position": ["nev_penetration", "nev_gap", "sales_deviation_rate", "revenue_per_vehicle"],
+    "legal_risk": ["execution_ratio", "dishonest_count", "commercial_paper_default"],
+    "operation": ["rd_capitalization_ratio", "free_cashflow", "guarantee_ratio", "recall_density"],
+}
+
 INDICATOR_THRESHOLDS = {
     "current_ratio": {"best": (1.5, 100), "good": (1.0, 80), "ok": (0.8, 60), "bad": (0.0, 30)},
     "quick_ratio": {"best": (1.0, 100), "good": (0.8, 80), "ok": (0.5, 60), "bad": (0.0, 30)},
@@ -97,7 +114,10 @@ def parse_value(val) -> float:
 
 
 def score_indicator(key: str, raw_val) -> float:
-    if raw_val is None or raw_val == "N/A":
+    # data missing -> neutral score, skip threshold decision
+    if raw_val is None:
+        return 50.0
+    if raw_val == "N/A":
         return 50.0
     threshold = INDICATOR_THRESHOLDS.get(key)
     if threshold is None:
@@ -120,7 +140,11 @@ def score_indicator(key: str, raw_val) -> float:
         return t["bad"][1]
 
 
-def _to_float(v: Any, default: float = 0.0) -> float:
+def _to_float(v: Any, default: float | None = None) -> float | None:
+    """
+    Convert to float.
+    - Missing/empty/NaN/Inf -> None (or provided default).
+    """
     if v is None:
         return default
     if isinstance(v, str):
@@ -144,12 +168,33 @@ class IndicatorEngineV2:
         self._data_warnings: list[str] = []
         self.validation_report: dict[str, Any] = {}
 
-    def safe_divide(self, a, b):
-        a_s = pd.Series(a) if not isinstance(a, pd.Series) else a
-        b_s = pd.Series(b) if not isinstance(b, pd.Series) else b
-        condition = (b_s != 0) & (b_s.notna())
-        res = np.where(condition, a_s / b_s, np.where(a_s > 0, float("inf"), 0))
-        return pd.Series(res, index=a_s.index)
+    def safe_divide(self, numerator, denominator, default=None):
+        """
+        Safe divide that distinguishes real 0 from "missing/uncomputable".
+        - Scalar: if denominator is 0/NaN -> return default (if not None) else None
+        - Series/array: returns pd.Series with NaN for uncomputable (or filled by default if provided)
+        """
+        # scalar path
+        if not isinstance(numerator, (pd.Series, list, tuple, np.ndarray)) and not isinstance(
+            denominator, (pd.Series, list, tuple, np.ndarray)
+        ):
+            try:
+                if denominator == 0 or pd.isna(denominator):
+                    return default if default is not None else None
+                if pd.isna(numerator):
+                    return default if default is not None else None
+                return float(numerator) / float(denominator)
+            except Exception:
+                return default if default is not None else None
+
+        # vector path (keep numeric dtype; use NaN to represent missing)
+        a_s = pd.Series(numerator) if not isinstance(numerator, pd.Series) else numerator
+        b_s = pd.Series(denominator) if not isinstance(denominator, pd.Series) else denominator
+        condition = (b_s != 0) & (b_s.notna()) & (a_s.notna())
+        res = pd.Series(np.where(condition, a_s / b_s, np.nan), index=a_s.index)
+        if default is not None:
+            res = res.fillna(default)
+        return res
 
     def safe_get(self, val, default=None):
         if val is None:
@@ -295,12 +340,37 @@ class IndicatorEngineV2:
         )
         prev = prev_res.mappings().first() or {}
 
-        total_assets = _to_float(row.get("total_assets"))
-        total_liabilities = _to_float(row.get("total_liabilities"))
+        # NOTE: keep arithmetic-safe defaults for core financials
+        total_assets = _to_float(row.get("total_assets"), default=0.0) or 0.0
+        total_liabilities = _to_float(row.get("total_liabilities"), default=0.0) or 0.0
         net_assets = total_assets - total_liabilities
-        operating_revenue = _to_float(row.get("revenue"))
-        net_profit = _to_float(row.get("net_profit"))
+        operating_revenue = _to_float(row.get("revenue"), default=0.0) or 0.0
+        net_profit = _to_float(row.get("net_profit"), default=0.0) or 0.0
         operating_profit = net_profit
+
+        # smart unit detection for execution_amount
+        _execution_raw = row.get("execution_amount")
+        if _execution_raw is None:
+            # fallback: some datasets only have lawsuit_total_amount
+            _execution_raw = row.get("lawsuit_total_amount")
+        if _execution_raw is not None:
+            try:
+                _execution_float = float(_execution_raw)
+            except (TypeError, ValueError):
+                _execution_float = 0.0
+            if _execution_float > 0:
+                if _execution_float < 10000:
+                    # < 1万: likely 万元, convert to 元
+                    execution_amount = _execution_float * 10000
+                elif _execution_float > 100_0000_0000:
+                    # > 100亿: likely already 元, convert to 万元 for later ratio calc
+                    execution_amount = _execution_float / 10000
+                else:
+                    execution_amount = _execution_float
+            else:
+                execution_amount = None
+        else:
+            execution_amount = None
 
         mapped = {
             "stock_code": stock_code,
@@ -312,37 +382,37 @@ class IndicatorEngineV2:
             "net_profit": net_profit,
             "net_assets": net_assets,
             "total_liabilities": total_liabilities,
-            "current_ratio": _to_float(row.get("current_ratio")),
-            "quick_ratio": _to_float(row.get("quick_ratio")),
-            "roe": _to_float(row.get("roe")),
-            "operating_cashflow": _to_float(row.get("operating_cash_flow")),
-            "sales_volume": _to_float(row.get("total_sales_volume")),
-            "production_volume": _to_float(row.get("total_sales_volume")),
-            "nev_sales_volume": _to_float(row.get("nev_sales_volume")),
-            "lawsuit_count": _to_float(row.get("lawsuit_count")),
-            "lawsuit_total_amount": _to_float(row.get("lawsuit_total_amount")),
+            "current_ratio": _to_float(row.get("current_ratio"), default=None),
+            "quick_ratio": _to_float(row.get("quick_ratio"), default=None),
+            "roe": _to_float(row.get("roe"), default=None),
+            "operating_cashflow": _to_float(row.get("operating_cash_flow"), default=None),
+            "sales_volume": _to_float(row.get("total_sales_volume"), default=None),
+            "production_volume": _to_float(row.get("total_sales_volume"), default=None),
+            "nev_sales_volume": _to_float(row.get("nev_sales_volume"), default=None),
+            "lawsuit_count": _to_float(row.get("lawsuit_count"), default=None),
+            "lawsuit_total_amount": _to_float(row.get("lawsuit_total_amount"), default=None),
             "industry_nev_penetration": 35.0,
-            "dishonest_count": 0.0,
-            "commercial_paper_default": 0.0,
-            "pledge_ratio": 0.0,
-            "recall_count": 0.0,
-            "rd_total": 0.0,
-            "rd_capitalized": 0.0,
-            "capex": 0.0,
-            "guarantee_amount": 0.0,
-            "execution_amount": _to_float(row.get("lawsuit_total_amount")) * 10000.0,
-            "short_term_loan": 0.0,
-            "long_term_loan": 0.0,
-            "bonds_payable": 0.0,
-            "inventory": 0.0,
-            "accounts_receivable": 0.0,
-            "current_assets": 0.0,
-            "current_liability": 0.0,
-            "prev_total_assets": _to_float(prev.get("total_assets")),
-            "prev_operating_revenue": _to_float(prev.get("operating_revenue")),
-            "prev_net_assets": _to_float(prev.get("net_assets")),
-            "prev_inventory": 0.0,
-            "prev_accounts_receivable": 0.0,
+            "dishonest_count": None,
+            "commercial_paper_default": None,
+            "pledge_ratio": None,
+            "recall_count": None,
+            "rd_total": None,
+            "rd_capitalized": None,
+            "capex": None,
+            "guarantee_amount": None,
+            "execution_amount": execution_amount,
+            "short_term_loan": None,
+            "long_term_loan": None,
+            "bonds_payable": None,
+            "inventory": None,
+            "accounts_receivable": None,
+            "current_assets": None,
+            "current_liability": None,
+            "prev_total_assets": _to_float(prev.get("total_assets"), default=None),
+            "prev_operating_revenue": _to_float(prev.get("operating_revenue"), default=None),
+            "prev_net_assets": _to_float(prev.get("net_assets"), default=None),
+            "prev_inventory": None,
+            "prev_accounts_receivable": None,
         }
         return mapped
 
@@ -377,11 +447,12 @@ class IndicatorEngineV2:
         if "current_ratio" not in df.columns:
             df["current_ratio"] = current_ratio_fallback
         else:
-            df["current_ratio"] = pd.to_numeric(df["current_ratio"], errors="coerce").fillna(current_ratio_fallback)
+            # keep missing as NaN (do NOT fill with 0); fallback only for missing values
+            df["current_ratio"] = pd.to_numeric(df["current_ratio"], errors="coerce").where(df["current_ratio"].notna(), current_ratio_fallback)
         if "quick_ratio" not in df.columns:
             df["quick_ratio"] = quick_ratio_fallback
         else:
-            df["quick_ratio"] = pd.to_numeric(df["quick_ratio"], errors="coerce").fillna(quick_ratio_fallback)
+            df["quick_ratio"] = pd.to_numeric(df["quick_ratio"], errors="coerce").where(df["quick_ratio"].notna(), quick_ratio_fallback)
 
         prev_assets = get_prev("prev_total_assets")
         avg_assets = (df["total_assets"] + prev_assets.fillna(df["total_assets"])) / 2
@@ -401,7 +472,7 @@ class IndicatorEngineV2:
         if "roe" not in df.columns:
             df["roe"] = roe_fallback
         else:
-            df["roe"] = pd.to_numeric(df["roe"], errors="coerce").fillna(roe_fallback)
+            df["roe"] = pd.to_numeric(df["roe"], errors="coerce").where(df["roe"].notna(), roe_fallback)
         df["operating_profit_margin"] = self.safe_divide(df["operating_profit"], df["operating_revenue"])
 
         df["asset_growth"] = self.safe_divide(df["total_assets"] - prev_assets, prev_assets)
@@ -568,6 +639,37 @@ class IndicatorEngineV2:
         return result
 
     def _calculate_scores(self, indicators: dict[str, Any]) -> dict[str, Any]:
+        # 1) completeness per dimension (based on indicator values, treat None/"N/A" as missing)
+        completeness: dict[str, float] = {}
+        for dim, inds in DIMENSION_INDICATORS.items():
+            if not inds:
+                completeness[dim] = 0.0
+                continue
+            dim_data = indicators.get(dim, {}) if isinstance(indicators.get(dim), dict) else {}
+            filled = 0
+            for ind in inds:
+                v = dim_data.get(ind)
+                if v is None:
+                    continue
+                if isinstance(v, str) and v.strip().upper() == "N/A":
+                    continue
+                filled += 1
+            completeness[dim] = filled / len(inds)
+
+        # 2) effective weights reallocation
+        base_weights = dict(DIMENSION_WEIGHTS)
+        valid_dims = {k for k, v in completeness.items() if v > 0.3}
+        if valid_dims:
+            total_w = sum(base_weights.get(k, 0.0) for k in valid_dims) or 0.0
+            if total_w > 0:
+                effective_weights = {
+                    k: (round(base_weights[k] / total_w, 4) if k in valid_dims else 0.0) for k in base_weights
+                }
+            else:
+                effective_weights = base_weights
+        else:
+            effective_weights = base_weights
+
         dimension_scores = {}
         indicator_scores = {}
         for dim_key, _ in DIMENSION_WEIGHTS.items():
@@ -585,7 +687,7 @@ class IndicatorEngineV2:
                 dim_score += ind_score * ind_weight
                 total_w += ind_weight
             dimension_scores[dim_key] = round(dim_score / total_w, 1) if total_w > 0 else 50.0
-        total_score = sum(dimension_scores[d] * w for d, w in DIMENSION_WEIGHTS.items())
+        total_score = sum(dimension_scores.get(d, 50.0) * effective_weights.get(d, 0.0) for d in DIMENSION_WEIGHTS)
         if total_score >= 80:
             grade, desc = "A", "经营优秀"
         elif total_score >= 65:
@@ -600,6 +702,8 @@ class IndicatorEngineV2:
             "grade_desc": desc,
             "dimension_scores": dimension_scores,
             "indicator_scores": indicator_scores,
+            "completeness": {k: round(v, 4) for k, v in completeness.items()},
+            "effective_weights": effective_weights,
         }
 
 

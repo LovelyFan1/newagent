@@ -111,10 +111,13 @@ class AgentOrchestrator:
     ) -> dict[str, Any]:
         tmpl = self._prompt_env.get_template(template_name)
         prompt = tmpl.render(query=query, enterprises=enterprises, years=years, evidence=[e.model_dump() for e in evidence])
-        r = await self.llm.chat(system="你只输出合法 JSON（对象）。中文输出。", user=prompt, temperature=0.2)
-        obj = extract_json_object(r.content) or {"role": role, "error": "invalid_json", "raw": safe_text(r.content, 500)}
-        obj["role"] = role
-        return obj
+        try:
+            r = await self.llm.chat(system="你只输出合法 JSON（对象）。中文输出。", user=prompt, temperature=0.2)
+            obj = extract_json_object(r.content) or {"role": role, "error": "invalid_json", "raw": safe_text(r.content, 500)}
+            obj["role"] = role
+            return obj
+        except Exception as e:
+            return {"role": role, "error": f"{type(e).__name__}: {e}", "raw": ""}
 
     async def _run_chief_agent(
         self,
@@ -135,17 +138,24 @@ class AgentOrchestrator:
             evidence=[e.model_dump() for e in evidence],
             role_outputs=role_outputs,
         )
-        r = await self.llm.chat(system="你只输出合法 JSON（对象）。中文输出。", user=prompt, temperature=0.2)
-        obj = extract_json_object(r.content)
-        if not obj:
+        try:
+            r = await self.llm.chat(system="你只输出合法 JSON（对象）。中文输出。", user=prompt, temperature=0.2)
+            obj = extract_json_object(r.content)
+            if not obj:
+                return EnhancedReport(
+                    summary="首席 Agent 输出解析失败，已返回降级报告。",
+                    sections={"role_outputs": role_outputs, "raw": safe_text(r.content, 800)},
+                )
             return EnhancedReport(
-                summary="首席 Agent 输出解析失败，已返回降级报告。",
-                sections={"role_outputs": role_outputs, "raw": safe_text(r.content, 800)},
+                summary=str(obj.get("summary") or "（无摘要）"),
+                sections=obj.get("sections") if isinstance(obj.get("sections"), dict) else {"data": obj},
             )
-        return EnhancedReport(
-            summary=str(obj.get("summary") or "（无摘要）"),
-            sections=obj.get("sections") if isinstance(obj.get("sections"), dict) else {"data": obj},
-        )
+        except Exception:
+            # hard fallback: offline report style (still returns evidence_trail in ResponseComposer)
+            return EnhancedReport(
+                summary="LLM 调用失败，已返回基于本地证据的降级报告。",
+                sections={"role_outputs": role_outputs, "charts": {}},
+            )
 
     def _format_compat_response(
         self,

@@ -1,0 +1,15 @@
+你是一名“信用分析师”，请基于证据为企业做信用/偿债能力研判。
+
+输入：
+- query: {{ query }}
+- enterprises: {{ enterprises }}
+- years: {{ years }}
+- evidence: {{ evidence | tojson }}
+
+要求：只输出一个 JSON 对象，包含字段：
+{
+  "summary": "80-160字",
+  "key_points": ["...","..."],
+  "signals": {"liquidity": "...", "profitability": "..."},
+  "confidence": 0.0-1.0
+}

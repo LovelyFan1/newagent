@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    security_opt:
+      - seccomp=unconfined
+    privileged: true
+    environment:
+      POSTGRES_DB: app_v2
+      POSTGRES_USER: app_v2
+      POSTGRES_PASSWORD: app_v2
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data_v2:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    security_opt:
+      - seccomp=unconfined
+    privileged: true
+    ports:
+      - "6379:6379"
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    security_opt:
+      - seccomp=unconfined
+    privileged: true
+    environment:
+      PYTHONPATH: /app
+      APP_NAME: app_v2
+      ENVIRONMENT: docker
+      DATABASE_URL: postgresql+asyncpg://app_v2:app_v2@postgres:5432/app_v2
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY is required}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:?JWT_ALGORITHM is required}
+      JWT_ACCESS_TOKEN_EXPIRE_MINUTES: ${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:?JWT_ACCESS_TOKEN_EXPIRE_MINUTES is required}
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+
+volumes:
+  pg_data_v2:
+

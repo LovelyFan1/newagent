@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime
 from typing import List, Optional
 
 from app.services.agent.utils import TimeRange
+
+logger = logging.getLogger(__name__)
 
 
 class IntentDetector:
@@ -31,6 +34,12 @@ class IntentDetector:
         "小米",
         "宁德时代",
     ]
+    _ENTERPRISE_ALIASES = {
+        "理想汽车": "理想",
+        "长城汽车": "长城",
+        "比亚迪汽车": "比亚迪",
+    }
+    _SENTIMENT_KEYWORDS = ("舆情", "新闻", "口碑", "舆论")
 
     _CHAT_PATTERNS = [
         r"^(你好|您好|嗨|hi|hello|在吗|在不在|早上好|晚上好|谢谢|感谢|你是谁|介绍下你自己)",
@@ -45,6 +54,44 @@ class IntentDetector:
     ]
 
     _TASK_KEYWORDS = r"(分析|对比|风险|机会|建议|报告|评估|结论|怎么做|怎么看|是否|值不值得|投资|买|卖|加仓|减仓)"
+    _SIMPLE_METRIC_KEYWORDS = (
+        "销量",
+        "销售",
+        "趋势",
+        "走势",
+        "变化",
+        "增长",
+        "下降",
+        "营收",
+        "收入",
+        "净利润",
+        "利润",
+        "总资产",
+        "负债",
+        "ROE",
+        "roe",
+        "流动比率",
+    )
+    _SIMPLE_METRIC_INTERCEPT_KEYWORDS = (
+        "为什么",
+        "原因",
+        "归因",
+        "怎么回事",
+        "是什么导致",
+    )
+    _ANALYTIC_GUARD_KEYWORDS = (
+        "为什么",
+        "原因",
+        "分析",
+        "归因",
+        "评估",
+        "风险",
+        "对比",
+        "建议",
+        "投资",
+        "怎么",
+        "如何",
+    )
 
     def is_gibberish(self, query: str) -> bool:
         q = (query or "").strip()
@@ -83,6 +130,11 @@ class IntentDetector:
         if not q:
             return []
         mentions: List[str] = []
+        for alias, canonical in self._ENTERPRISE_ALIASES.items():
+            if alias in q and canonical not in mentions:
+                mentions.append(canonical)
+            if canonical in q and canonical not in mentions:
+                mentions.append(canonical)
         parts = re.split(r"(?:和|与|vs|VS|Vs|、|,|，|\s+)", q)
         for raw in parts:
             token = (raw or "").strip()
@@ -108,7 +160,14 @@ class IntentDetector:
             norm = m.upper()
             if norm not in mentions:
                 mentions.append(norm)
-        return mentions
+        # Canonicalize and dedupe aliases like "理想/理想汽车" to avoid false multi-enterprise comparison.
+        canonical_mentions: List[str] = []
+        for m in mentions:
+            c = self._canonicalize_enterprise_name(m)
+            if c and c not in canonical_mentions:
+                canonical_mentions.append(c)
+        logger.info("[INTENT] extract_enterprises query=%s mentions=%s canonical=%s", q, mentions, canonical_mentions)
+        return canonical_mentions
 
     def extract_time_range(self, query: str) -> Optional[TimeRange]:
         text = (query or "").strip()
@@ -131,4 +190,36 @@ class IntentDetector:
             return TimeRange(kind="LAST_3_YEARS")
         # IMPORTANT: if user didn't provide any explicit/relative time, return None (force clarification)
         return None
+
+    def is_simple_metric_query(self, query: str) -> bool:
+        q = (query or "").strip()
+        if not q:
+            return False
+        # Cause-analysis follow-ups must go through deep analysis route.
+        if any(k in q for k in self._SIMPLE_METRIC_INTERCEPT_KEYWORDS):
+            return False
+        has_metric = any(k in q for k in self._SIMPLE_METRIC_KEYWORDS)
+        has_analytic_guard = any(k in q for k in self._ANALYTIC_GUARD_KEYWORDS)
+        return has_metric and not has_analytic_guard
+
+    def is_sentiment_query(self, query: str) -> bool:
+        q = (query or "").strip()
+        if not q:
+            return False
+        return any(k in q for k in self._SENTIMENT_KEYWORDS)
+
+    def _canonicalize_enterprise_name(self, name: str) -> str:
+        n = (name or "").strip()
+        if not n:
+            return ""
+        if n in self._ENTERPRISE_ALIASES:
+            return self._ENTERPRISE_ALIASES[n]
+        for alias, canonical in self._ENTERPRISE_ALIASES.items():
+            if n == canonical:
+                return canonical
+            if n.endswith("汽车") and n[:-2] == canonical:
+                return canonical
+            if n == alias:
+                return canonical
+        return n
 

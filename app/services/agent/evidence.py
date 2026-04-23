@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
+import re
 from typing import Any, List
 
 from pydantic import BaseModel, Field
@@ -9,6 +12,8 @@ from app.services.agent.utils import TimeRange, new_evidence_id, safe_text
 from app.services.indicator_calc import calculate_indicators
 from app.services.scoring_service import scoring_service
 from app.services.vector_retriever import vector_retriever
+
+logger = logging.getLogger(__name__)
 
 
 class Evidence(BaseModel):
@@ -43,10 +48,38 @@ class EvidenceRetriever:
                 continue
             evidence.extend(r)
 
-        # RAG retrieval for analysis/decision
+        has_scoring_evidence = any(e.source == "local_scoring_service" for e in evidence)
+
+        # Comparison-oriented analysis should rely on structured local data first.
+        # Skip RAG to reduce latency and avoid introducing noisy context.
+        q_text = (query or "")
+        has_comparison_keyword = bool(re.search(r"(对比|比较|谁更|哪个好|排名)", q_text))
+        is_multi_enterprise_comparison = intent in {"analysis", "decision"} and (
+            len(enterprises) >= 2 or has_comparison_keyword
+        )
+
+        skip_rag = True
+        use_rag = (
+            bool(query)
+            and intent in {"analysis", "decision"}
+            and self._has_complex_analysis_keyword(query)
+            and (not skip_rag)
+            and (not is_multi_enterprise_comparison)
+        )
+
+        # RAG retrieval only for truly complex analysis queries
         rag_evidence: list[Evidence] = []
-        if intent in {"analysis", "decision"} and query:
+        if use_rag:
+            logger.info("[RAG] retrieving knowledge evidence for query=%s", safe_text(query, 120))
             rag_evidence = await self._retrieve_vector(query=query, top_k=5)
+        else:
+            logger.info(
+                "[RAG] skipped intent=%s has_scoring=%s skip_rag=%s query=%s",
+                intent,
+                has_scoring_evidence,
+                skip_rag,
+                safe_text(query, 120) if query else "",
+            )
 
         # merge strategy:
         # - if structured is weak/empty, rag as primary
@@ -60,6 +93,29 @@ class EvidenceRetriever:
             merged.extend(web)
 
         return merged
+
+    def _is_simple_metric_query(self, query: str | None) -> bool:
+        if not query:
+            return False
+        q = query.strip()
+        simple_metric_keywords = (
+            "销量",
+            "销售",
+            "营收",
+            "收入",
+            "净利润",
+            "利润",
+            "总资产",
+            "负债",
+            "ROE",
+            "roe",
+            "流动比率",
+        )
+        complex_keywords = ("分析", "评估", "风险", "竞争力", "前景", "建议", "对比", "策略", "投资")
+        return any(k in q for k in simple_metric_keywords) and not any(k in q for k in complex_keywords)
+
+    def _has_complex_analysis_keyword(self, query: str) -> bool:
+        return bool(re.search(r"(风险|竞争力|前景|评估|分析|建议|对比|策略|投资)", query))
 
     async def _retrieve_vector(self, query: str, top_k: int = 5) -> list[Evidence]:
         docs = await vector_retriever.retrieve(query=query, top_k=top_k)
@@ -108,22 +164,55 @@ class EvidenceRetriever:
 
     async def _retrieve_scoring(self, enterprise: str, year: int) -> list[Evidence]:
         try:
-            score = await scoring_service.calculate_score(enterprise, year)
+            raw = await scoring_service.get_raw_data(enterprise, year)
+            if raw:
+                scored = scoring_service.calculate_score_from_raw_data(raw_data=raw, year=year)
+            else:
+                score = await scoring_service.calculate_score(enterprise, year)
+                if not score:
+                    return []
+                excerpt = (
+                    f"{enterprise} {year} 风险评分：total={score.get('total_score')}, rating={score.get('rating')}, "
+                    f"dimension_scores={score.get('dimension_scores')}。"
+                )
+                return [
+                    Evidence(
+                        evidence_id=new_evidence_id("score"),
+                        source_type="local",
+                        source="local_scoring_service",
+                        title=f"{enterprise} {year} 风险评分结果",
+                        excerpt=safe_text(excerpt, 520),
+                        url_or_path=None,
+                        confidence=0.9,
+                    )
+                ]
         except Exception:
             return []
-        if not score:
-            return []
-        excerpt = (
-            f"{enterprise} {year} 风险评分：total={score.get('total_score')}, rating={score.get('rating')}, "
-            f"dimension_scores={score.get('dimension_scores')}。"
-        )
+        payload: dict[str, Any] = {
+            "enterprise": enterprise,
+            "year": year,
+            "deterministic_scoring": {
+                "total_score": scored.get("total_score"),
+                "rating": scored.get("rating"),
+                "confidence": scored.get("confidence"),
+                "effective_weights": scored.get("effective_weights"),
+                "dimension_scores": scored.get("dimension_scores"),
+                "indicator_scores": scored.get("indicator_scores"),
+            },
+            "indicator_attribution": raw.get("attribution"),
+            "all_indicator_scores": raw.get("all_indicator_scores"),
+        }
+        # Keep full JSON for LLM + downstream parsers; avoid mid-JSON truncation (breaks json.loads).
+        excerpt = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        if len(excerpt) > 12000:
+            excerpt = excerpt[:11997] + "..."
         return [
             Evidence(
                 evidence_id=new_evidence_id("score"),
                 source_type="local",
                 source="local_scoring_service",
                 title=f"{enterprise} {year} 风险评分结果",
-                excerpt=safe_text(excerpt, 520),
+                excerpt=excerpt,
                 url_or_path=None,
                 confidence=0.9,
             )

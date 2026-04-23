@@ -59,8 +59,20 @@ class VectorRetriever:
             vec_literal = "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
 
         async with sm() as db:
-            await db.execute(sa.text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-            await db.commit()
+            bind = db.get_bind()
+            dialect_name = bind.dialect.name if bind is not None else ""
+            is_pg = dialect_name == "postgresql"
+
+            if is_pg:
+                try:
+                    await db.execute(sa.text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+                    await db.commit()
+                except Exception:
+                    await db.rollback()
+                    logger.warning(
+                        "Vector retrieval degraded",
+                        extra={"reason": "pg_trgm_extension_failed", "query": query, "fallback": "vector+keyword"},
+                    )
 
             if vec_literal is not None:
                 vector_sql = sa.text(
@@ -94,29 +106,30 @@ class VectorRetriever:
                     extra={"reason": "low_vector_similarity", "query": query, "fallback": "trgm+keyword"},
                 )
 
-            trigram_sql = sa.text(
-                """
-                SELECT
-                  id,
-                  title,
-                  content,
-                  source,
-                  similarity(content, :q) AS score
-                FROM documents
-                WHERE similarity(content, :q) > 0.3
-                ORDER BY similarity(content, :q) DESC
-                LIMIT :cand_k
-                """
-            )
-            try:
-                trigram_rows = [dict(r) for r in (await db.execute(trigram_sql, {"q": query, "cand_k": cand_k})).mappings().all()]
-            except Exception:
-                await db.rollback()
-                logger.warning(
-                    "Vector retrieval degraded",
-                    extra={"reason": "trigram_query_failed", "query": query, "fallback": "keyword"},
+            if is_pg:
+                trigram_sql = sa.text(
+                    """
+                    SELECT
+                      id,
+                      title,
+                      content,
+                      source,
+                      similarity(content, :q) AS score
+                    FROM documents
+                    WHERE similarity(content, :q) > 0.3
+                    ORDER BY similarity(content, :q) DESC
+                    LIMIT :cand_k
+                    """
                 )
-                trigram_rows = []
+                try:
+                    trigram_rows = [dict(r) for r in (await db.execute(trigram_sql, {"q": query, "cand_k": cand_k})).mappings().all()]
+                except Exception:
+                    await db.rollback()
+                    logger.warning(
+                        "Vector retrieval degraded",
+                        extra={"reason": "trigram_query_failed", "query": query, "fallback": "keyword"},
+                    )
+                    trigram_rows = []
 
             # merge weighted scores by id
             merged: dict[int, dict] = {}
@@ -152,7 +165,8 @@ class VectorRetriever:
                 params: dict[str, object] = {"cand_k": cand_k}
                 for i, tok in enumerate(tokens):
                     key = f"t{i}"
-                    where_clauses.append(f"(title ILIKE :{key} OR content ILIKE :{key})")
+                    op = "ILIKE" if is_pg else "LIKE"
+                    where_clauses.append(f"(title {op} :{key} OR content {op} :{key})")
                     params[key] = f"%{tok}%"
                 if where_clauses:
                     kw_sql = sa.text(
@@ -188,23 +202,31 @@ class VectorRetriever:
 
             # ensure at least 1-3 results when KB is non-empty
             if not ranked_rows:
-                kb_cnt = await db.execute(sa.text("SELECT COUNT(*)::int FROM documents"))
-                total_docs = int(kb_cnt.scalar() or 0)
+                try:
+                    kb_cnt = await db.execute(sa.text("SELECT CAST(COUNT(*) AS INTEGER) FROM documents"))
+                    total_docs = int(kb_cnt.scalar() or 0)
+                except Exception:
+                    await db.rollback()
+                    total_docs = 0
                 if total_docs > 0:
-                    recent = (
-                        await db.execute(
-                            sa.text(
-                                """
-                                SELECT id, title, content, source, 0.15 AS score
-                                FROM documents
-                                ORDER BY id DESC
-                                LIMIT :n
-                                """
-                            ),
-                            {"n": max(1, min(3, int(top_k)))},
-                        )
-                    ).mappings().all()
-                    ranked_rows = [dict(r) for r in recent]
+                    try:
+                        recent = (
+                            await db.execute(
+                                sa.text(
+                                    """
+                                    SELECT id, title, content, source, 0.15 AS score
+                                    FROM documents
+                                    ORDER BY id DESC
+                                    LIMIT :n
+                                    """
+                                ),
+                                {"n": max(1, min(3, int(top_k)))},
+                            )
+                        ).mappings().all()
+                        ranked_rows = [dict(r) for r in recent]
+                    except Exception:
+                        await db.rollback()
+                        ranked_rows = []
                     logger.warning(
                         "Vector retrieval degraded",
                         extra={"reason": "empty_after_all_fallbacks", "query": query, "fallback": "recent_docs"},

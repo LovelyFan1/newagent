@@ -128,13 +128,22 @@ def score_indicator(key: str, raw_val) -> float:
         return 50.0
 
     t = threshold
-    if val >= t["best"][0]:
+    best_t = t["best"][0]
+    good_t = t["good"][0]
+    ok_t = t["ok"][0]
+    if val >= best_t:
         return t["best"][1]
-    elif val >= t["good"][0]:
-        ratio = (val - t["good"][0]) / (t["best"][0] - t["good"][0])
+    elif val >= good_t:
+        denom = best_t - good_t
+        if denom == 0:
+            return t["good"][1]
+        ratio = (val - good_t) / denom
         return t["good"][1] + ratio * (t["best"][1] - t["good"][1])
-    elif val >= t["ok"][0]:
-        ratio = (val - t["ok"][0]) / (t["good"][0] - t["ok"][0])
+    elif val >= ok_t:
+        denom = good_t - ok_t
+        if denom == 0:
+            return t["ok"][1]
+        ratio = (val - ok_t) / denom
         return t["ok"][1] + ratio * (t["good"][1] - t["ok"][1])
     else:
         return t["bad"][1]
@@ -191,7 +200,12 @@ class IndicatorEngineV2:
         a_s = pd.Series(numerator) if not isinstance(numerator, pd.Series) else numerator
         b_s = pd.Series(denominator) if not isinstance(denominator, pd.Series) else denominator
         condition = (b_s != 0) & (b_s.notna()) & (a_s.notna())
-        res = pd.Series(np.where(condition, a_s / b_s, np.nan), index=a_s.index)
+        a_vals = pd.to_numeric(a_s, errors="coerce").to_numpy(dtype=float, copy=False)
+        b_vals = pd.to_numeric(b_s, errors="coerce").to_numpy(dtype=float, copy=False)
+        cond_vals = pd.Series(condition).to_numpy(dtype=bool, copy=False)
+        out = np.full_like(a_vals, np.nan, dtype=float)
+        np.divide(a_vals, b_vals, out=out, where=cond_vals)
+        res = pd.Series(out, index=a_s.index)
         if default is not None:
             res = res.fillna(default)
         return res
@@ -287,6 +301,59 @@ class IndicatorEngineV2:
                 self._data_warnings.append(f"NEV数据可疑: {ent_name} 渗透率100%且总销量<10万辆，数据可能不完整，请人工核实")
         return df
 
+    def _extract_financial_absolute(self, row: dict[str, Any]) -> dict[str, Any]:
+        total_assets = _to_float(row.get("total_assets"), default=None)
+        total_liabilities = _to_float(row.get("total_liabilities"), default=None)
+        net_assets = None
+        if total_assets is not None and total_liabilities is not None:
+            net_assets = total_assets - total_liabilities
+        operating_revenue = _to_float(row.get("revenue"), default=None)
+        net_profit = _to_float(row.get("net_profit"), default=None)
+        operating_profit = net_profit
+        return {
+            "total_assets": total_assets,
+            "total_liabilities": total_liabilities,
+            "net_assets": net_assets,
+            "operating_revenue": operating_revenue,
+            "net_profit": net_profit,
+            "operating_profit": operating_profit,
+            "current_ratio": _to_float(row.get("current_ratio"), default=None),
+            "quick_ratio": _to_float(row.get("quick_ratio"), default=None),
+            "roe": _to_float(row.get("roe"), default=None),
+            "operating_cashflow": _to_float(row.get("operating_cash_flow"), default=None),
+        }
+
+    def _extract_sales_data(self, row: dict[str, Any]) -> dict[str, Any]:
+        sales_volume = _to_float(row.get("total_sales_volume"), default=None)
+        return {
+            "sales_volume": sales_volume,
+            "production_volume": sales_volume,
+            "nev_sales_volume": _to_float(row.get("nev_sales_volume"), default=None),
+        }
+
+    def _extract_legal_data(self, row: dict[str, Any]) -> dict[str, Any]:
+        execution_amount = None
+        _execution_raw = row.get("execution_amount")
+        if _execution_raw is None:
+            _execution_raw = row.get("lawsuit_total_amount")
+        if _execution_raw is not None:
+            try:
+                _execution_float = float(_execution_raw)
+            except (TypeError, ValueError):
+                _execution_float = 0.0
+            if _execution_float > 0:
+                if _execution_float < 10000:
+                    execution_amount = _execution_float * 10000
+                elif _execution_float > 100_0000_0000:
+                    execution_amount = _execution_float / 10000
+                else:
+                    execution_amount = _execution_float
+        return {
+            "lawsuit_count": _to_float(row.get("lawsuit_count"), default=None),
+            "lawsuit_total_amount": _to_float(row.get("lawsuit_total_amount"), default=None),
+            "execution_amount": execution_amount,
+        }
+
     async def _fetch_raw_data(self, db: AsyncSession, stock_code: str, year: int) -> dict[str, Any] | None:
         base_sql = sa.text(
             """
@@ -323,7 +390,7 @@ class IndicatorEngineV2:
             SELECT
               total_assets,
               revenue AS operating_revenue,
-              (COALESCE(total_assets, '0')::float - COALESCE(total_liabilities, '0')::float)::text AS net_assets
+              (CAST(COALESCE(total_assets, '0') AS REAL) - CAST(COALESCE(total_liabilities, '0') AS REAL)) AS net_assets
             FROM fact_financials
             WHERE enterprise_id = :enterprise_id AND CAST(year AS INTEGER) = :prev_year
             LIMIT 1
@@ -340,57 +407,17 @@ class IndicatorEngineV2:
         )
         prev = prev_res.mappings().first() or {}
 
-        # NOTE: keep arithmetic-safe defaults for core financials
-        total_assets = _to_float(row.get("total_assets"), default=0.0) or 0.0
-        total_liabilities = _to_float(row.get("total_liabilities"), default=0.0) or 0.0
-        net_assets = total_assets - total_liabilities
-        operating_revenue = _to_float(row.get("revenue"), default=0.0) or 0.0
-        net_profit = _to_float(row.get("net_profit"), default=0.0) or 0.0
-        operating_profit = net_profit
-
-        # smart unit detection for execution_amount
-        _execution_raw = row.get("execution_amount")
-        if _execution_raw is None:
-            # fallback: some datasets only have lawsuit_total_amount
-            _execution_raw = row.get("lawsuit_total_amount")
-        if _execution_raw is not None:
-            try:
-                _execution_float = float(_execution_raw)
-            except (TypeError, ValueError):
-                _execution_float = 0.0
-            if _execution_float > 0:
-                if _execution_float < 10000:
-                    # < 1万: likely 万元, convert to 元
-                    execution_amount = _execution_float * 10000
-                elif _execution_float > 100_0000_0000:
-                    # > 100亿: likely already 元, convert to 万元 for later ratio calc
-                    execution_amount = _execution_float / 10000
-                else:
-                    execution_amount = _execution_float
-            else:
-                execution_amount = None
-        else:
-            execution_amount = None
+        financial_data = self._extract_financial_absolute(row)
+        sales_data = self._extract_sales_data(row)
+        legal_data = self._extract_legal_data(row)
 
         mapped = {
             "stock_code": stock_code,
             "enterprise_name": row.get("stock_name") or stock_code,
             "report_date": f"{year}-12-31",
-            "total_assets": total_assets,
-            "operating_revenue": operating_revenue,
-            "operating_profit": operating_profit,
-            "net_profit": net_profit,
-            "net_assets": net_assets,
-            "total_liabilities": total_liabilities,
-            "current_ratio": _to_float(row.get("current_ratio"), default=None),
-            "quick_ratio": _to_float(row.get("quick_ratio"), default=None),
-            "roe": _to_float(row.get("roe"), default=None),
-            "operating_cashflow": _to_float(row.get("operating_cash_flow"), default=None),
-            "sales_volume": _to_float(row.get("total_sales_volume"), default=None),
-            "production_volume": _to_float(row.get("total_sales_volume"), default=None),
-            "nev_sales_volume": _to_float(row.get("nev_sales_volume"), default=None),
-            "lawsuit_count": _to_float(row.get("lawsuit_count"), default=None),
-            "lawsuit_total_amount": _to_float(row.get("lawsuit_total_amount"), default=None),
+            **financial_data,
+            **sales_data,
+            **legal_data,
             "industry_nev_penetration": 35.0,
             "dishonest_count": None,
             "commercial_paper_default": None,
@@ -400,7 +427,7 @@ class IndicatorEngineV2:
             "rd_capitalized": None,
             "capex": None,
             "guarantee_amount": None,
-            "execution_amount": execution_amount,
+            "execution_amount": legal_data.get("execution_amount"),
             "short_term_loan": None,
             "long_term_loan": None,
             "bonds_payable": None,
@@ -506,31 +533,47 @@ class IndicatorEngineV2:
             except Exception:
                 return False
 
+        def gt0(v) -> bool:
+            if v is None:
+                return False
+            try:
+                return float(v) > 0
+            except (TypeError, ValueError):
+                return False
+
+        def gt_threshold(v, t: float) -> bool:
+            if not is_valid(v):
+                return False
+            try:
+                return float(v) > t
+            except (TypeError, ValueError):
+                return False
+
         cash_ok = is_valid(row["cashflow_coverage"])
         exec_ok = is_valid(row["execution_ratio"])
-        if (cash_ok and row["cashflow_coverage"] < 0.05 and exec_ok and row["execution_ratio"] > 0.05) or row[
-            "commercial_paper_default"
-        ] > 0 or row["dishonest_count"] > 0:
+        if (cash_ok and row["cashflow_coverage"] < 0.05 and exec_ok and row["execution_ratio"] > 0.05) or gt0(
+            row["commercial_paper_default"]
+        ) or gt0(row["dishonest_count"]):
             if cash_ok and row["cashflow_coverage"] < 0.05:
                 reasons.append("现金流严重不足")
             if exec_ok and row["execution_ratio"] > 0.05:
                 reasons.append("被执行金额占比过高")
-            if row["commercial_paper_default"] > 0:
+            if gt0(row["commercial_paper_default"]):
                 reasons.append("存在商票逾期")
-            if row["dishonest_count"] > 0:
+            if gt0(row["dishonest_count"]):
                 reasons.append("列入失信名单")
             return "RED", "|".join(reasons)
 
         dev_ok = is_valid(row["sales_deviation_rate"])
         debt_ok = is_valid(row["debt_ebitda_ratio"])
-        if (dev_ok and row["sales_deviation_rate"] > 0.20) or (debt_ok and row["debt_ebitda_ratio"] > 5) or row[
-            "pledge_ratio"
-        ] > 70:
+        if (dev_ok and row["sales_deviation_rate"] > 0.20) or (debt_ok and row["debt_ebitda_ratio"] > 5) or gt_threshold(
+            row["pledge_ratio"], 70.0
+        ):
             if dev_ok and row["sales_deviation_rate"] > 0.20:
                 reasons.append("产销严重偏差(库存积压)")
             if debt_ok and row["debt_ebitda_ratio"] > 5:
                 reasons.append("债务压力极大(EBITDA覆盖倍数高)")
-            if row["pledge_ratio"] > 70:
+            if gt_threshold(row["pledge_ratio"], 70.0):
                 reasons.append("大股东股权质押率过高")
             return "ORANGE", "|".join(reasons)
 
@@ -556,15 +599,22 @@ class IndicatorEngineV2:
         level_map = {"RED": "D", "ORANGE": "C", "YELLOW": "B", "GREEN": "A"}
         ent_warnings = [w for w in self._unit_warnings + self._data_warnings if w.split(":")[0] in ["execution_amount", "NEV数据异常", "NEV数据可疑"]]
 
-        revenue = float(row.get("operating_revenue", 0.0) or 0.0)
-        net_profit = float(row.get("net_profit", row.get("operating_profit", 0.0) * 0.85) or 0.0)
-        total_assets = float(row.get("total_assets", 0.0) or 0.0)
-        total_liabilities = float(row.get("total_liabilities", max(total_assets - float(row.get("net_assets", 0.0) or 0.0), 0.0)))
-        sales_volume = float(row.get("sales_volume", 0.0) or 0.0)
-        production_volume = float(row.get("production_volume", 0.0) or 0.0)
-        nev_sales_volume = float(row.get("nev_sales_volume", 0.0) or 0.0)
-        lawsuit_count = float(row.get("lawsuit_count", 0.0) or 0.0)
-        lawsuit_total_amount = float(row.get("lawsuit_total_amount", 0.0) or 0.0)
+        revenue = _to_float(row.get("operating_revenue"), default=None)
+        net_profit = _to_float(row.get("net_profit"), default=None)
+        if net_profit is None:
+            op = _to_float(row.get("operating_profit"), default=None)
+            net_profit = (op * 0.85) if op is not None else None
+        total_assets = _to_float(row.get("total_assets"), default=None)
+        net_assets_raw = _to_float(row.get("net_assets"), default=None)
+        total_liabilities = _to_float(row.get("total_liabilities"), default=None)
+        if total_liabilities is None and total_assets is not None and net_assets_raw is not None:
+            total_liabilities = max(total_assets - net_assets_raw, 0.0)
+        sales_volume = _to_float(row.get("sales_volume"), default=None)
+        production_volume = _to_float(row.get("production_volume"), default=None)
+        nev_sales_volume = _to_float(row.get("nev_sales_volume"), default=None)
+        lawsuit_count = _to_float(row.get("lawsuit_count"), default=None)
+        lawsuit_total_amount = _to_float(row.get("lawsuit_total_amount"), default=None)
+        debt_asset_ratio = self.safe_divide(total_liabilities, total_assets, default=None)
 
         # attribution: draggers top5 + missing补齐
         indicator_scores_detail: list[dict[str, Any]] = []
@@ -608,6 +658,7 @@ class IndicatorEngineV2:
                     "net_profit": self.format_ratio(net_profit, 6),
                     "total_assets": self.format_ratio(total_assets, 6),
                     "total_liabilities": self.format_ratio(total_liabilities, 6),
+                    "debt_asset_ratio": self.format_ratio(debt_asset_ratio, 4),
                     "current_ratio": self.format_ratio(row["current_ratio"], 4),
                     "quick_ratio": self.format_ratio(row["quick_ratio"], 4),
                     "cashflow_coverage": self.format_ratio(row["cashflow_coverage"], 3),

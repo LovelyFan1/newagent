@@ -10,7 +10,7 @@ import hashlib
 import json
 from typing import Any, Dict, Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -151,6 +151,46 @@ def score_indicator(key: str, raw_val) -> float:
 
 
 class ScoringService:
+    async def _ensure_scoring_results_table(self, db: AsyncSession) -> None:
+        bind = db.get_bind()
+        dialect_name = bind.dialect.name if bind is not None else ""
+        is_pg = dialect_name == "postgresql"
+        if is_pg:
+            ddl = """
+            CREATE TABLE IF NOT EXISTS public.scoring_results (
+                id SERIAL PRIMARY KEY,
+                stock_code VARCHAR(64) NOT NULL,
+                stock_name VARCHAR(320) NOT NULL,
+                year INTEGER NOT NULL,
+                dimension_scores JSONB NOT NULL,
+                total_score DOUBLE PRECISION NOT NULL,
+                rating VARCHAR(8) NOT NULL,
+                data_hash VARCHAR(32) NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """
+        else:
+            ddl = """
+            CREATE TABLE IF NOT EXISTS scoring_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                stock_code TEXT NOT NULL,
+                stock_name TEXT NOT NULL,
+                year INTEGER NOT NULL,
+                dimension_scores TEXT NOT NULL,
+                total_score REAL NOT NULL,
+                rating TEXT NOT NULL,
+                data_hash TEXT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        await db.execute(text(ddl))
+        await db.execute(text("CREATE INDEX IF NOT EXISTS ix_scoring_results_stock_code ON scoring_results (stock_code);"))
+        await db.execute(
+            text("CREATE UNIQUE INDEX IF NOT EXISTS ix_scoring_results_stock_code_year ON scoring_results (stock_code, year);")
+        )
+        await db.execute(text("CREATE INDEX IF NOT EXISTS ix_scoring_results_data_hash ON scoring_results (data_hash);"))
+        await db.commit()
+
     async def get_raw_data(self, stock_code: str, year: int) -> Optional[Dict[str, Any]]:
         try:
             return await calculate_indicators(stock_code, year)
@@ -267,24 +307,45 @@ class ScoringService:
         }
 
     async def calculate(self, db: AsyncSession, stock_code: str, year: int, force: bool = False) -> Optional[Dict[str, Any]]:
+        await self._ensure_scoring_results_table(db)
         raw_data = await self.get_raw_data(stock_code, year)
         if raw_data is None:
             return None
 
         raw_data_str = json.dumps(raw_data, sort_keys=True, default=str)
         data_hash = hashlib.md5(raw_data_str.encode()).hexdigest()
+        bind = db.get_bind()
+        dialect_name = bind.dialect.name if bind is not None else ""
+        is_pg = dialect_name == "postgresql"
 
-        existing = (
-            await db.execute(select(ScoringResult).where(ScoringResult.stock_code == stock_code, ScoringResult.year == year))
-        ).scalar_one_or_none()
+        if is_pg:
+            existing = (
+                await db.execute(select(ScoringResult).where(ScoringResult.stock_code == stock_code, ScoringResult.year == year))
+            ).scalar_one_or_none()
+        else:
+            existing = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT id, stock_code, stock_name, year, dimension_scores, total_score, rating, data_hash
+                        FROM scoring_results
+                        WHERE stock_code = :stock_code AND year = :year
+                        LIMIT 1
+                        """
+                    ),
+                    {"stock_code": stock_code, "year": year},
+                )
+            ).mappings().first()
 
-        if (not force) and existing is not None and existing.data_hash == data_hash:
+        if (not force) and existing is not None and (
+            (existing.data_hash == data_hash) if is_pg else ((existing.get("data_hash") if existing else None) == data_hash)
+        ):
             # Return a fresh response (includes confidence/effective_weights) but keep cache as source of truth.
             return self.calculate_score_from_raw_data(raw_data=raw_data, year=year)
 
         result = self.calculate_score_from_raw_data(raw_data=raw_data, year=year)
 
-        if existing is not None:
+        if existing is not None and is_pg:
             existing.stock_code = stock_code
             existing.stock_name = str(raw_data.get("enterprise_name") or stock_code)
             existing.year = year
@@ -296,22 +357,73 @@ class ScoringService:
                 await db.commit()
             except IntegrityError:
                 await db.rollback()
-        else:
-            record = ScoringResult(
-                stock_code=stock_code,
-                stock_name=str(raw_data.get("enterprise_name") or stock_code),
-                year=year,
-                dimension_scores=result["dimension_scores"],
-                total_score=float(result["total_score"]),
-                rating=str(result["rating"]),
-                data_hash=data_hash,
-            )
-            db.add(record)
+        elif existing is not None and (not is_pg):
             try:
+                await db.execute(
+                    text(
+                        """
+                        UPDATE scoring_results
+                        SET stock_name = :stock_name,
+                            dimension_scores = :dimension_scores,
+                            total_score = :total_score,
+                            rating = :rating,
+                            data_hash = :data_hash
+                        WHERE stock_code = :stock_code AND year = :year
+                        """
+                    ),
+                    {
+                        "stock_code": stock_code,
+                        "stock_name": str(raw_data.get("enterprise_name") or stock_code),
+                        "year": year,
+                        "dimension_scores": json.dumps(result["dimension_scores"], ensure_ascii=False, sort_keys=True),
+                        "total_score": float(result["total_score"]),
+                        "rating": str(result["rating"]),
+                        "data_hash": data_hash,
+                    },
+                )
                 await db.commit()
             except IntegrityError:
-                # concurrent requests may insert same (stock_code, year)
                 await db.rollback()
+        else:
+            if is_pg:
+                record = ScoringResult(
+                    stock_code=stock_code,
+                    stock_name=str(raw_data.get("enterprise_name") or stock_code),
+                    year=year,
+                    dimension_scores=result["dimension_scores"],
+                    total_score=float(result["total_score"]),
+                    rating=str(result["rating"]),
+                    data_hash=data_hash,
+                )
+                db.add(record)
+                try:
+                    await db.commit()
+                except IntegrityError:
+                    # concurrent requests may insert same (stock_code, year)
+                    await db.rollback()
+            else:
+                try:
+                    await db.execute(
+                        text(
+                            """
+                            INSERT INTO scoring_results
+                            (stock_code, stock_name, year, dimension_scores, total_score, rating, data_hash)
+                            VALUES (:stock_code, :stock_name, :year, :dimension_scores, :total_score, :rating, :data_hash)
+                            """
+                        ),
+                        {
+                            "stock_code": stock_code,
+                            "stock_name": str(raw_data.get("enterprise_name") or stock_code),
+                            "year": year,
+                            "dimension_scores": json.dumps(result["dimension_scores"], ensure_ascii=False, sort_keys=True),
+                            "total_score": float(result["total_score"]),
+                            "rating": str(result["rating"]),
+                            "data_hash": data_hash,
+                        },
+                    )
+                    await db.commit()
+                except IntegrityError:
+                    await db.rollback()
         return result
 
     async def calculate_score(self, stock_code: str, year: int) -> Optional[Dict[str, Any]]:

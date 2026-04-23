@@ -40,13 +40,14 @@
     '证据分析师正在校验证据...',
     '决策分析师正在生成结论...',
   ];
-  const CHART_THEME = {
+  const TECH_THEME = {
     primary: '#4f8cff',
     secondary: '#34d399',
     accent: '#f59e0b',
     danger: '#ef4444',
     muted: '#94a3b8',
   };
+  const CHART_THEME = TECH_THEME;
   let lastRenderedChartState = null;
   let currentEvidence = [];
   let isSending = false;
@@ -441,25 +442,9 @@
   function ensureChartDom() {
     const content = document.getElementById('chartContent');
     if (!content) return null;
-    // 若旧页面缓存/局部更新导致缺容器，则补齐
     let gaugeEl = document.getElementById('gaugeChart');
     let scatterEl = document.getElementById('scatterChart');
     let textEl = document.getElementById('chartTextBlocks');
-    if (!gaugeEl || !scatterEl || !textEl) {
-      content.innerHTML =
-        '<div id="gaugeChart" class="chart-box" style="height:260px;"></div>' +
-        '<div id="scatterChart" class="chart-box" style="height:340px;"></div>' +
-        '<div id="radarChart" class="chart-box" style="height:320px;"></div>' +
-        '<div id="barChart" class="chart-box" style="height:320px;"></div>' +
-        '<div id="lineChart" class="chart-box" style="height:320px;"></div>' +
-        '<div id="stackedBarChart" class="chart-box" style="height:320px;"></div>' +
-        '<div id="heatmapChart" class="chart-box" style="height:260px;"></div>' +
-        '<div id="wordcloudChart" class="chart-box" style="min-height:140px;"></div>' +
-        '<div id="chartTextBlocks"></div>';
-      gaugeEl = document.getElementById('gaugeChart');
-      scatterEl = document.getElementById('scatterChart');
-      textEl = document.getElementById('chartTextBlocks');
-    }
     const radarEl = document.getElementById('radarChart');
     const barEl = document.getElementById('barChart');
     const lineEl = document.getElementById('lineChart');
@@ -467,6 +452,53 @@
     const heatmapEl = document.getElementById('heatmapChart');
     const wordcloudEl = document.getElementById('wordcloudChart');
     return { content: content, gaugeEl: gaugeEl, scatterEl: scatterEl, radarEl: radarEl, barEl: barEl, lineEl: lineEl, stackedEl: stackedEl, heatmapEl: heatmapEl, wordcloudEl: wordcloudEl, textEl: textEl };
+  }
+
+  function getChartGrid() {
+    const content = document.getElementById('chartContent');
+    if (!content) return null;
+    let grid = document.getElementById('chartGrid');
+    if (!grid) {
+      grid = document.createElement('div');
+      grid.id = 'chartGrid';
+      content.appendChild(grid);
+    }
+    return grid;
+  }
+
+  function adjustChartLayout() {
+    const chartGrid = document.getElementById('chartGrid');
+    if (!chartGrid) return;
+    const cards = Array.from(chartGrid.querySelectorAll('.chart-card'));
+    if (cards.length === 1) {
+      cards[0].classList.add('fullscreen-card');
+      return;
+    }
+    cards.forEach(function (card) {
+      card.classList.remove('fullscreen-card');
+    });
+  }
+
+  // v2.2 enhancement compatibility: dynamic chart card creation.
+  function createChartCard(title, badge) {
+    const wrap = document.createElement('div');
+    wrap.className = 'chart-card chart-box';
+    wrap.style.height = '320px';
+    const header = document.createElement('div');
+    header.className = 'chart-card-header';
+    header.style.display = 'flex';
+    header.style.justifyContent = 'space-between';
+    header.style.alignItems = 'center';
+    header.style.marginBottom = '8px';
+    header.innerHTML =
+      '<strong>' + escapeHtml(title || '图表') + '</strong>' +
+      (badge ? '<span style="font-size:12px;color:#94a3b8;">' + escapeHtml(badge) + '</span>' : '');
+    const body = document.createElement('div');
+    body.className = 'chart-card-body';
+    body.style.height = '260px';
+    wrap.appendChild(header);
+    wrap.appendChild(body);
+    return { card: wrap, box: body };
   }
 
   function renderRadarChart(el, radar) {
@@ -527,6 +559,55 @@
       tooltip: { trigger: 'axis' },
     });
     el.__chart__ = chart;
+    return true;
+  }
+
+  function renderRankingBarChart(rankingBar, chartGrid) {
+    if (!chartGrid || !window.echarts) return false;
+    const categories = (rankingBar && rankingBar.categories) || [];
+    const series = (rankingBar && rankingBar.series) || [];
+    if (!categories.length || !series.length) return false;
+    const c = createChartCard('综合排名（按总分降序）', 'comparison_ranking');
+    chartGrid.appendChild(c.card);
+    const inst = window.echarts.init(c.box, null, { renderer: 'canvas' });
+    const values = Array.isArray(series[0].data) ? series[0].data : [];
+    const barData = values.map(function (v, idx) {
+      return {
+        value: v,
+        itemStyle: {
+          color: idx === 0 ? '#d6b97a' : CHART_THEME.primary,
+        },
+      };
+    });
+    inst.setOption({
+      backgroundColor: 'transparent',
+      grid: { left: 70, right: 24, top: 16, bottom: 30, containLabel: true },
+      xAxis: { type: 'value', axisLabel: { color: 'rgba(255,255,255,.65)' }, splitLine: { lineStyle: { color: 'rgba(255,255,255,.08)' } } },
+      yAxis: { type: 'category', data: categories, axisLabel: { color: 'rgba(255,255,255,.72)' }, axisLine: { lineStyle: { color: 'rgba(255,255,255,.15)' } } },
+      series: [{ type: 'bar', data: barData }],
+      tooltip: { trigger: 'axis' },
+    });
+    return true;
+  }
+
+  function renderMetricSeriesCard(metricSeries) {
+    if (!window.echarts) return false;
+    const chartGrid = getChartGrid();
+    if (!chartGrid) return false;
+    const c = createChartCard('指标趋势', 'simple_metric');
+    chartGrid.appendChild(c.card);
+    const categories = Array.isArray(metricSeries.categories) ? metricSeries.categories : [];
+    const s0 = (metricSeries.series && metricSeries.series[0]) || { name: '指标', data: [] };
+    const preferredType = metricSeries.type === 'line' || metricSeries.type === 'bar' ? metricSeries.type : null;
+    const inst = window.echarts.init(c.box, null, { renderer: 'canvas' });
+    inst.setOption({
+      backgroundColor: 'transparent',
+      grid: { left: 56, right: 18, top: 30, bottom: 42 },
+      xAxis: { type: 'category', data: categories, axisLabel: { color: 'rgba(255,255,255,.65)' }, axisLine: { lineStyle: { color: 'rgba(255,255,255,.15)' } } },
+      yAxis: { type: 'value', axisLabel: { color: 'rgba(255,255,255,.65)' }, splitLine: { lineStyle: { color: 'rgba(255,255,255,.08)' } } },
+      series: [{ type: preferredType || (categories.length > 1 ? 'line' : 'bar'), data: Array.isArray(s0.data) ? s0.data : [], smooth: true, itemStyle: { color: CHART_THEME.primary }, lineStyle: { color: CHART_THEME.primary } }],
+      tooltip: { trigger: 'axis' },
+    });
     return true;
   }
 
@@ -613,49 +694,131 @@
   }
 
   function renderCharts(charts, answer) {
-    const dom = ensureChartDom();
-    if (!dom || !dom.content) {
+    try {
+      window.__LAST_CHARTS__ = charts;
+      console.log('renderCharts called', charts);
+    } catch (_) {}
+    const content = document.getElementById('chartContent');
+    const chartGrid = getChartGrid();
+    if (!content || !chartGrid) {
       console.warn('chartContent 容器不存在，跳过渲染');
       return;
     }
+
+    // Render immediately; avoid timer-driven re-render loops.
     const normalized = normalizeCharts(charts);
-    lastRenderedChartState = { charts: normalized, answer: answer || {} };
-    const radarSeries = normalized.radar.series[0] || {};
-    const barSeries = normalized.bar.series[0] || {};
-    const lineSeries = normalized.line.series[0] || {};
-    // ECharts：优先渲染 gauge / scatter（投资意图）
-    const gaugeOk = renderEChartsGauge(dom.gaugeEl, normalized.gauge.value);
-    const scatterOk = charts && charts.scatter ? renderEChartsScatter(dom.scatterEl, charts.scatter) : false;
-    if (!scatterOk && dom.scatterEl) {
-      dom.scatterEl.innerHTML = renderNoDataPlaceholder('散点图', '暂无风险-收益数据');
+    // Keep raw charts payload for resize re-render.
+    // Using normalized payload here can drop metric_series and clear simple_metric charts.
+    lastRenderedChartState = { charts: charts || {}, answer: answer || {} };
+    const chartType = (charts && charts.chart_type) || 'analysis';
+    chartGrid.innerHTML = '';
+
+    if (chartType === 'simple_metric' && charts && charts.metric_series) {
+      renderMetricSeriesCard(charts.metric_series);
+      adjustChartLayout();
+      return;
     }
-    if (!gaugeOk && dom.gaugeEl) {
-      dom.gaugeEl.innerHTML = renderGauge(normalized.gauge.value);
+    if (chartType === 'comparison_ranking') {
+      if (charts && charts.ranking_bar) renderRankingBarChart(charts.ranking_bar, chartGrid);
+      if (charts && charts.radar) {
+        const rc = createChartCard('综合能力雷达', 'comparison_radar');
+        chartGrid.appendChild(rc.card);
+        renderRadarChart(rc.box, charts.radar);
+      }
+      if (charts && charts.scatter) {
+        const sc = createChartCard('风险-收益散点', 'scatter');
+        chartGrid.appendChild(sc.card);
+        renderEChartsScatter(sc.box, charts.scatter);
+      }
+      adjustChartLayout();
+      return;
+    }
+    if (chartType === 'legal_risk') {
+      if (charts && charts.stacked_bar) {
+        const sc = createChartCard('司法案件结构', 'stacked_bar');
+        chartGrid.appendChild(sc.card);
+        renderStackedBar(sc.box, charts.stacked_bar);
+      }
+      if (charts && charts.heatmap) {
+        const hc = createChartCard('司法风险热力', 'heatmap');
+        chartGrid.appendChild(hc.card);
+        renderHeatmap(hc.box, charts.heatmap);
+      }
+      adjustChartLayout();
+      return;
+    }
+    if (chartType === 'sentiment') {
+      const sentimentCard = createChartCard('舆情与风险摘要', 'sentiment');
+      chartGrid.appendChild(sentimentCard.card);
+      const blocks = [];
+      if (charts && charts.wordcloud) {
+        blocks.push(renderWordcloud(charts.wordcloud));
+      }
+      if (answer && Array.isArray(answer.key_findings) && answer.key_findings.length) {
+        blocks.push(
+          '<div class="chart-box"><h3 style="margin:0 0 8px 0;">舆情要点</h3><p style="margin:0;color:#d1d5db;">' +
+            answer.key_findings.slice(0, 5).map(escapeHtml).join('<br>') +
+            '</p></div>'
+        );
+      }
+      if (!blocks.length) {
+        blocks.push(renderNoDataPlaceholder('舆情分析', '当前查询未返回可视化舆情数据'));
+      }
+      sentimentCard.box.innerHTML = blocks.join('');
+      adjustChartLayout();
+      return;
+    }
+    if (chartType === 'general') {
+      const generalCard = createChartCard('通用分析摘要', 'general');
+      chartGrid.appendChild(generalCard.card);
+      const summary = answer && (answer.user_facing_reply || answer.summary);
+      generalCard.box.innerHTML = summary
+        ? '<div class=\"chart-box\"><p style=\"margin:0;color:#d1d5db;\">' + escapeHtml(summary) + '</p></div>'
+        : renderNoDataPlaceholder('通用分析', '当前查询未返回可视化图表');
+      adjustChartLayout();
+      return;
     }
 
-    renderRadarChart(dom.radarEl, charts && charts.radar ? charts.radar : normalized.radar);
-    renderBarChart(dom.barEl, charts && charts.bar ? charts.bar : normalized.bar);
-    renderLineChart(dom.lineEl, charts && charts.line ? charts.line : normalized.line);
-    renderStackedBar(dom.stackedEl, charts && charts.stacked_bar ? charts.stacked_bar : null);
-    renderHeatmap(dom.heatmapEl, charts && charts.heatmap ? charts.heatmap : null);
-    renderWordcloudChart(dom.wordcloudEl, charts && charts.wordcloud ? charts.wordcloud : []);
-
-    const blocks = [
-      renderRadarSummary(normalized.radar.indicators, Array.isArray(radarSeries.value) ? radarSeries.value : []),
-      renderSimpleBars(normalized.bar.categories, Array.isArray(barSeries.data) ? barSeries.data : [], CHART_THEME.primary),
-      renderLineSummary(normalized.line.categories, Array.isArray(lineSeries.data) ? lineSeries.data : []),
-    ];
-    if (charts && charts.heatmap) blocks.push(renderHeatmapChart(charts.heatmap));
-    if (charts && charts.wordcloud) blocks.push(renderWordcloud(charts.wordcloud));
-    if (charts && charts.stacked_bar) blocks.push(renderStackedBarChart(charts.stacked_bar));
-    if (answer && Array.isArray(answer.key_findings) && answer.key_findings.length) {
-      blocks.push(
-        '<div class="chart-box"><h3 style="margin:0 0 8px 0;">关键发现</h3><p style="margin:0;color:#d1d5db;">' +
-          answer.key_findings.slice(0, 4).map(escapeHtml).join('<br>') +
-          '</p></div>'
-      );
+    // Generic analysis rendering: only create cards with real chart data.
+    if (charts && charts.scatter && Array.isArray(charts.scatter.series) && charts.scatter.series.length) {
+      const scatterCard = createChartCard('风险-收益散点', 'scatter');
+      chartGrid.appendChild(scatterCard.card);
+      renderEChartsScatter(scatterCard.box, charts.scatter);
     }
-    if (dom.textEl) dom.textEl.innerHTML = blocks.join('');
+    if (charts && charts.radar && Array.isArray(charts.radar.series) && charts.radar.series.length) {
+      const radarCard = createChartCard('综合能力雷达', 'radar');
+      chartGrid.appendChild(radarCard.card);
+      renderRadarChart(radarCard.box, charts.radar);
+    }
+    if (charts && charts.ranking_bar && Array.isArray(charts.ranking_bar.categories) && charts.ranking_bar.categories.length) {
+      renderRankingBarChart(charts.ranking_bar, chartGrid);
+    }
+    if (charts && charts.bar && Array.isArray(charts.bar.categories) && charts.bar.categories.length) {
+      const barCard = createChartCard('对比柱状图', 'bar');
+      chartGrid.appendChild(barCard.card);
+      renderBarChart(barCard.box, charts.bar);
+    }
+    if (charts && charts.line && Array.isArray(charts.line.categories) && charts.line.categories.length) {
+      const lineCard = createChartCard('趋势折线', 'line');
+      chartGrid.appendChild(lineCard.card);
+      renderLineChart(lineCard.box, charts.line);
+    }
+    if (charts && charts.stacked_bar && Array.isArray(charts.stacked_bar.categories) && charts.stacked_bar.categories.length) {
+      const stackedCard = createChartCard('结构堆积', 'stacked_bar');
+      chartGrid.appendChild(stackedCard.card);
+      renderStackedBar(stackedCard.box, charts.stacked_bar);
+    }
+    if (charts && charts.heatmap && Array.isArray(charts.heatmap.categories) && charts.heatmap.categories.length) {
+      const heatmapCard = createChartCard('热力分布', 'heatmap');
+      chartGrid.appendChild(heatmapCard.card);
+      renderHeatmap(heatmapCard.box, charts.heatmap);
+    }
+    if (charts && charts.wordcloud && Array.isArray(charts.wordcloud) && charts.wordcloud.length) {
+      const wordcloudCard = createChartCard('关键词词云', 'wordcloud');
+      chartGrid.appendChild(wordcloudCard.card);
+      renderWordcloudChart(wordcloudCard.box, charts.wordcloud);
+    }
+    adjustChartLayout();
   }
 
   function renderScatterChart(scatter) {
@@ -779,31 +942,67 @@
 
   function renderReportMessage(result) {
     const report = result.report || {};
-    const sections = report.sections || {};
-    const findings = Array.isArray(sections.key_findings) ? sections.key_findings : [];
-    const attrs = Array.isArray(sections.attributions) ? sections.attributions : [];
-    const recs = Array.isArray(sections.recommendations) ? sections.recommendations : [];
-    function fmtAttr(a) {
-      if (!a) return '';
-      if (typeof a === 'string') return a;
-      if (typeof a === 'object') {
-        const obs = a.observation || '';
-        const causes = Array.isArray(a.causes) ? a.causes : [];
-        const eids = Array.isArray(a.evidence_ids) ? a.evidence_ids : [];
-        return [obs, causes.length ? ('原因：' + causes.join('；')) : '', eids.length ? ('证据：' + eids.join(', ')) : ''].filter(Boolean).join('\n');
-      }
-      return String(a);
+    // Keep dialogue concise: only show final summary.
+    append('bot', safeText(report.summary, '暂无摘要'));
+  }
+
+  function metricDisplayName(metric) {
+    const m = String(metric || '').toLowerCase();
+    const map = {
+      sales_volume: '销量',
+      revenue: '营收',
+      net_profit: '净利润',
+      total_assets: '总资产',
+      roe: 'ROE',
+    };
+    return map[m] || safeText(metric, '指标');
+  }
+
+  function metricDisplayUnit(metric) {
+    const m = String(metric || '').toLowerCase();
+    if (m === 'sales_volume') return '辆';
+    return '';
+  }
+
+  function buildFastPathMetricText(charts) {
+    const ms = charts && charts.metric_series;
+    if (!ms) return '';
+    const categories = Array.isArray(ms.categories) ? ms.categories : [];
+    const s0 = (ms.series && ms.series[0]) || {};
+    const data = Array.isArray(s0.data) ? s0.data : [];
+    const enterprise = safeText(ms.enterprise || s0.name, '该企业');
+    const metric = metricDisplayName(ms.metric);
+    const unit = metricDisplayUnit(ms.metric);
+    const points = [];
+    for (let i = 0; i < Math.min(categories.length, data.length); i += 1) {
+      const v = data[i];
+      if (v === null || v === undefined || Number.isNaN(Number(v))) continue;
+      points.push({ year: String(categories[i]), value: Number(v) });
     }
-    append(
-      'bot',
-      [
-        '摘要：' + safeText(report.summary, '暂无摘要'),
-        findings.length ? '关键发现：\n' + findings.map(function (x, i) { return i + 1 + '. ' + x; }).join('\n') : '',
-        attrs.length ? '归因依据：\n' + attrs.map(function (x, i) { return i + 1 + '. ' + fmtAttr(x); }).join('\n\n') : '',
-        recs.length ? '建议：\n' + recs.map(function (x, i) { return i + 1 + '. ' + x; }).join('\n') : '',
-      ]
-        .filter(Boolean)
-        .join('\n\n')
+    if (!points.length) return '';
+    if (points.length === 1) {
+      return enterprise + points[0].year + '年' + metric + '为 ' + points[0].value.toLocaleString() + (unit ? ' ' + unit : '');
+    }
+    const start = points[0];
+    const end = points[points.length - 1];
+    const rising = end.value > start.value;
+    const falling = end.value < start.value;
+    const trend = rising ? '呈逐年上升趋势' : falling ? '呈下降趋势' : '整体较为平稳';
+    return (
+      enterprise +
+      metric +
+      '从' +
+      start.year +
+      '年的' +
+      start.value.toLocaleString() +
+      '变化到' +
+      end.year +
+      '年的' +
+      end.value.toLocaleString() +
+      (unit ? unit : '') +
+      '，' +
+      trend +
+      '。'
     );
   }
 
@@ -869,16 +1068,24 @@
           } else {
             playFlowHint('正在整理分析结论...');
           }
-          renderReportMessage(result);
+          const sections = (result.report && result.report.sections) || {};
+          const isFastPath = sections.mode === 'simple_metric_fast_path';
+          if (isFastPath && result.charts) {
+            const directMetricText = buildFastPathMetricText(result.charts);
+            if (directMetricText) append('bot', directMetricText);
+            renderCharts(result.charts, answer);
+          } else {
+            renderReportMessage(result);
+          }
           // 若 answer 缺失或过短，使用 report.summary 做展示兜底
           try {
             const aText = (answer && (answer.user_facing_reply || answer.summary)) || '';
             const rSum = (result.report && result.report.summary) || '';
-            if ((!aText || String(aText).trim().length < 6) && rSum) {
+            if (!isFastPath && (!aText || String(aText).trim().length < 6) && rSum) {
               append('bot', '报告摘要：' + rSum);
             }
           } catch (_) {}
-          finishLoading(answer, result.charts);
+          if (!isFastPath) finishLoading(answer, result.charts);
           finishFlowProgress('分析完成').then(function () {
             if (!userCollapsedChartThisSession) {
               setChartCollapsed(false, false);
@@ -1044,12 +1251,8 @@
     console.warn('downloadPdfBtn 不存在，PDF下载按钮未挂载');
   }
 
-  window.addEventListener('resize', function () {
-    if (!lastRenderedChartState) return;
-    window.requestAnimationFrame(function () {
-      renderCharts(lastRenderedChartState.charts, lastRenderedChartState.answer);
-    });
-  });
+  // Keep chart rendering entrypoints request-driven (API response handlers only).
+
   function initMe() {
     window.apiClient
       .getMe()
@@ -1066,6 +1269,9 @@
   });
   window.addEventListener('online', function () {
     showToast('网络已恢复', 'info');
+  });
+  window.addEventListener('resize', function () {
+    adjustChartLayout();
   });
   initMe();
   append('sys', '欢迎使用。你可连续追问，系统会复用当前会话上下文。');

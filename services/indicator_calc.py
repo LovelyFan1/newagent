@@ -506,31 +506,47 @@ class IndicatorEngineV2:
             except Exception:
                 return False
 
+        def gt0(v) -> bool:
+            if v is None:
+                return False
+            try:
+                return float(v) > 0
+            except (TypeError, ValueError):
+                return False
+
+        def gt_threshold(v, t: float) -> bool:
+            if not is_valid(v):
+                return False
+            try:
+                return float(v) > t
+            except (TypeError, ValueError):
+                return False
+
         cash_ok = is_valid(row["cashflow_coverage"])
         exec_ok = is_valid(row["execution_ratio"])
-        if (cash_ok and row["cashflow_coverage"] < 0.05 and exec_ok and row["execution_ratio"] > 0.05) or row[
-            "commercial_paper_default"
-        ] > 0 or row["dishonest_count"] > 0:
+        if (cash_ok and row["cashflow_coverage"] < 0.05 and exec_ok and row["execution_ratio"] > 0.05) or gt0(
+            row["commercial_paper_default"]
+        ) or gt0(row["dishonest_count"]):
             if cash_ok and row["cashflow_coverage"] < 0.05:
                 reasons.append("现金流严重不足")
             if exec_ok and row["execution_ratio"] > 0.05:
                 reasons.append("被执行金额占比过高")
-            if row["commercial_paper_default"] > 0:
+            if gt0(row["commercial_paper_default"]):
                 reasons.append("存在商票逾期")
-            if row["dishonest_count"] > 0:
+            if gt0(row["dishonest_count"]):
                 reasons.append("列入失信名单")
             return "RED", "|".join(reasons)
 
         dev_ok = is_valid(row["sales_deviation_rate"])
         debt_ok = is_valid(row["debt_ebitda_ratio"])
-        if (dev_ok and row["sales_deviation_rate"] > 0.20) or (debt_ok and row["debt_ebitda_ratio"] > 5) or row[
-            "pledge_ratio"
-        ] > 70:
+        if (dev_ok and row["sales_deviation_rate"] > 0.20) or (debt_ok and row["debt_ebitda_ratio"] > 5) or gt_threshold(
+            row["pledge_ratio"], 70.0
+        ):
             if dev_ok and row["sales_deviation_rate"] > 0.20:
                 reasons.append("产销严重偏差(库存积压)")
             if debt_ok and row["debt_ebitda_ratio"] > 5:
                 reasons.append("债务压力极大(EBITDA覆盖倍数高)")
-            if row["pledge_ratio"] > 70:
+            if gt_threshold(row["pledge_ratio"], 70.0):
                 reasons.append("大股东股权质押率过高")
             return "ORANGE", "|".join(reasons)
 

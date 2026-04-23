@@ -79,7 +79,9 @@ class LLMGateway:
             except Exception as e:
                 last_err = e
                 logger.warning("llm_call_failed attempt=%s/%s err=%s", attempt, self.max_retries, type(e).__name__)
-                await asyncio.sleep(0.4 * attempt)
+                if attempt < self.max_retries:
+                    # Simple exponential backoff: 0.5s, 1s, 2s, 4s...
+                    await asyncio.sleep(0.5 * (2 ** (attempt - 1)))
         raise last_err or RuntimeError("llm_call_failed")
 
 

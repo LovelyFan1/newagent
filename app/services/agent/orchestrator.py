@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-import json
 from pathlib import Path
 from typing import Any
 
@@ -81,23 +79,31 @@ class AgentOrchestrator:
         if not self.llm.enabled:
             return offline_report_from_evidence(intent=intent, query=query, enterprises=enterprises, years=years, evidence=evidence)
 
-        # parallel role agents
-        credit_t = self._run_role_agent("credit_analyst.j2", role="credit", query=query, enterprises=enterprises, years=years, evidence=evidence)
-        industry_t = self._run_role_agent("industry_analyst.j2", role="industry", query=query, enterprises=enterprises, years=years, evidence=evidence)
-        risk_t = self._run_role_agent("risk_analyst.j2", role="risk", query=query, enterprises=enterprises, years=years, evidence=evidence)
-        invest_t = self._run_role_agent("investment_analyst.j2", role="investment", query=query, enterprises=enterprises, years=years, evidence=evidence)
-
-        role_outputs = await asyncio.gather(credit_t, industry_t, risk_t, invest_t)
-
-        chief = await self._run_chief_agent(
+        tmpl = self._prompt_env.get_template("unified_analyst.j2")
+        prompt = tmpl.render(
+            intent=intent,
             query=query,
             enterprises=enterprises,
             years=years,
-            evidence=evidence,
-            role_outputs=role_outputs,
-            intent=intent,
+            evidence=[e.model_dump() for e in evidence],
         )
-        return chief
+        try:
+            r = await self.llm.chat(system="你只输出合法 JSON（对象）。中文输出。", user=prompt, temperature=0.2)
+            obj = extract_json_object(r.content)
+            if not obj:
+                return EnhancedReport(
+                    summary="统一分析师输出解析失败，已返回降级报告。",
+                    sections={"raw": safe_text(r.content, 800)},
+                )
+            return EnhancedReport(
+                summary=str(obj.get("summary") or "（无摘要）"),
+                sections=obj.get("sections") if isinstance(obj.get("sections"), dict) else {"data": obj},
+            )
+        except Exception:
+            return EnhancedReport(
+                summary="LLM 调用失败，已返回基于本地证据的降级报告。",
+                sections={"charts": {}},
+            )
 
     async def _run_role_agent(
         self,

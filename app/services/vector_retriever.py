@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -43,154 +45,128 @@ class VectorRetriever:
 
     async def retrieve(self, query: str, top_k: int = 5) -> List[DocumentChunk]:
         sm = get_sessionmaker()
-        vec_rows: list[dict] = []
-        trigram_rows: list[dict] = []
         cand_k = 10
         threshold = float(os.environ.get("RAG_VECTOR_SIM_THRESHOLD", "0.5"))
-        vec_literal = None
-        if embedding_service._client is None:
-            logger.warning(
-                "Vector retrieval degraded",
-                extra={"reason": "embedding_client_unavailable", "query": query, "fallback": "trgm+keyword"},
-            )
-        vecs = await embedding_service.embed([query])
-        if vecs:
-            vec = vecs[0]
-            vec_literal = "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
+        vector_sql = sa.text(
+            """
+            SELECT
+              id,
+              title,
+              content,
+              source,
+              1 - (embedding <=> CAST(:vec AS vector)) AS score
+            FROM documents
+            WHERE embedding IS NOT NULL
+            ORDER BY embedding <=> CAST(:vec AS vector)
+            LIMIT :cand_k
+            """
+        )
+        trigram_sql = sa.text(
+            """
+            SELECT
+              id,
+              title,
+              content,
+              source,
+              similarity(content, :q) AS score
+            FROM documents
+            WHERE similarity(content, :q) > 0.3
+            ORDER BY similarity(content, :q) DESC
+            LIMIT :cand_k
+            """
+        )
 
-        async with sm() as db:
-            await db.execute(sa.text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-            await db.commit()
-
-            if vec_literal is not None:
-                vector_sql = sa.text(
-                    """
-                    SELECT
-                      id,
-                      title,
-                      content,
-                      source,
-                      1 - (embedding <=> CAST(:vec AS vector)) AS score
-                    FROM documents
-                    WHERE embedding IS NOT NULL
-                    ORDER BY embedding <=> CAST(:vec AS vector)
-                    LIMIT :cand_k
-                    """
-                )
-                try:
-                    vec_rows = [dict(r) for r in (await db.execute(vector_sql, {"vec": vec_literal, "cand_k": cand_k})).mappings().all()]
-                except Exception:
+        async def _ensure_pg_trgm(db) -> None:
+            try:
+                await db.execute(sa.text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+                if hasattr(db, "commit"):
+                    await db.commit()
+            except Exception:
+                if hasattr(db, "rollback"):
                     await db.rollback()
+
+        async def _vector_strategy() -> list[dict]:
+            try:
+                vec_literal = None
+                if embedding_service._client is None:
                     logger.warning(
                         "Vector retrieval degraded",
-                        extra={"reason": "pgvector_query_failed", "query": query, "fallback": "trgm+keyword"},
+                        extra={"reason": "embedding_client_unavailable", "query": query, "fallback": "trgm+keyword+recent"},
                     )
-                    vec_rows = []
+                vecs = await embedding_service.embed([query])
+                if vecs:
+                    vec = vecs[0]
+                    vec_literal = "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
+                if vec_literal is None:
+                    return []
 
-            top_score = float(vec_rows[0].get("score") or 0.0) if vec_rows else 0.0
-            if top_score < threshold:
+                async with sm() as db:
+                    rows = [dict(r) for r in (await db.execute(vector_sql, {"vec": vec_literal, "cand_k": cand_k})).mappings().all()]
+                top_score = float(rows[0].get("score") or 0.0) if rows else 0.0
+                if top_score < threshold:
+                    logger.warning(
+                        "Vector retrieval degraded",
+                        extra={"reason": "low_vector_similarity", "query": query, "fallback": "trgm+keyword+recent"},
+                    )
+                return rows
+            except Exception:
                 logger.warning(
                     "Vector retrieval degraded",
-                    extra={"reason": "low_vector_similarity", "query": query, "fallback": "trgm+keyword"},
+                    extra={"reason": "pgvector_query_failed", "query": query, "fallback": "trgm+keyword+recent"},
                 )
+                return []
 
-            trigram_sql = sa.text(
-                """
-                SELECT
-                  id,
-                  title,
-                  content,
-                  source,
-                  similarity(content, :q) AS score
+        async def _trigram_strategy() -> list[dict]:
+            try:
+                async with sm() as db:
+                    await _ensure_pg_trgm(db)
+                    return [dict(r) for r in (await db.execute(trigram_sql, {"q": query, "cand_k": cand_k})).mappings().all()]
+            except Exception:
+                logger.warning(
+                    "Vector retrieval degraded",
+                    extra={"reason": "trigram_query_failed", "query": query, "fallback": "keyword+recent"},
+                )
+                return []
+
+        async def _keyword_strategy() -> list[dict]:
+            tokens = self._keyword_tokens(query)
+            if not tokens:
+                return []
+            where_clauses = []
+            params: dict[str, object] = {"cand_k": cand_k}
+            for i, tok in enumerate(tokens):
+                key = f"t{i}"
+                where_clauses.append(f"(title ILIKE :{key} OR content ILIKE :{key})")
+                params[key] = f"%{tok}%"
+            if not where_clauses:
+                return []
+
+            kw_sql = sa.text(
+                f"""
+                SELECT id, title, content, source, 0.35 AS score
                 FROM documents
-                WHERE similarity(content, :q) > 0.3
-                ORDER BY similarity(content, :q) DESC
+                WHERE {" OR ".join(where_clauses)}
+                ORDER BY id DESC
                 LIMIT :cand_k
                 """
             )
             try:
-                trigram_rows = [dict(r) for r in (await db.execute(trigram_sql, {"q": query, "cand_k": cand_k})).mappings().all()]
+                async with sm() as db:
+                    return [dict(r) for r in (await db.execute(kw_sql, params)).mappings().all()]
             except Exception:
-                await db.rollback()
                 logger.warning(
                     "Vector retrieval degraded",
-                    extra={"reason": "trigram_query_failed", "query": query, "fallback": "keyword"},
+                    extra={"reason": "keyword_query_failed", "query": query, "fallback": "recent_docs"},
                 )
-                trigram_rows = []
+                return []
 
-            # merge weighted scores by id
-            merged: dict[int, dict] = {}
-            for r in vec_rows:
-                rid = int(r["id"])
-                merged[rid] = {
-                    "id": rid,
-                    "title": r.get("title"),
-                    "content": r.get("content") or "",
-                    "source": r.get("source"),
-                    "score": 0.65 * float(r.get("score") or 0.0),
-                }
-            for r in trigram_rows:
-                rid = int(r["id"])
-                weighted = 0.35 * float(r.get("score") or 0.0)
-                if rid in merged:
-                    merged[rid]["score"] = max(float(merged[rid]["score"]), float(merged[rid]["score"]) + weighted)
-                else:
-                    merged[rid] = {
-                        "id": rid,
-                        "title": r.get("title"),
-                        "content": r.get("content") or "",
-                        "source": r.get("source"),
-                        "score": weighted,
-                    }
-
-            ranked_rows = sorted(merged.values(), key=lambda x: float(x.get("score") or 0.0), reverse=True)
-
-            # keyword fallback if still weak/empty
-            if (not ranked_rows) or (float(ranked_rows[0].get("score") or 0.0) < 0.2):
-                tokens = self._keyword_tokens(query)
-                where_clauses = []
-                params: dict[str, object] = {"cand_k": cand_k}
-                for i, tok in enumerate(tokens):
-                    key = f"t{i}"
-                    where_clauses.append(f"(title ILIKE :{key} OR content ILIKE :{key})")
-                    params[key] = f"%{tok}%"
-                if where_clauses:
-                    kw_sql = sa.text(
-                        f"""
-                        SELECT id, title, content, source, 0.35 AS score
-                        FROM documents
-                        WHERE {" OR ".join(where_clauses)}
-                        ORDER BY id DESC
-                        LIMIT :cand_k
-                        """
-                    )
-                    try:
-                        kw_rows = [dict(r) for r in (await db.execute(kw_sql, params)).mappings().all()]
-                        for r in kw_rows:
-                            rid = int(r["id"])
-                            if rid in merged:
-                                merged[rid]["score"] = max(float(merged[rid]["score"]), 0.35)
-                            else:
-                                merged[rid] = {
-                                    "id": rid,
-                                    "title": r.get("title"),
-                                    "content": r.get("content") or "",
-                                    "source": r.get("source"),
-                                    "score": 0.35,
-                                }
-                    except Exception:
-                        await db.rollback()
-                        logger.warning(
-                            "Vector retrieval degraded",
-                            extra={"reason": "keyword_query_failed", "query": query, "fallback": "recent_docs"},
-                        )
-                ranked_rows = sorted(merged.values(), key=lambda x: float(x.get("score") or 0.0), reverse=True)
-
-            # ensure at least 1-3 results when KB is non-empty
-            if not ranked_rows:
-                kb_cnt = await db.execute(sa.text("SELECT COUNT(*)::int FROM documents"))
-                total_docs = int(kb_cnt.scalar() or 0)
-                if total_docs > 0:
+        async def _recent_strategy() -> list[dict]:
+            try:
+                async with sm() as db:
+                    kb_cnt = await db.execute(sa.text("SELECT COUNT(*)::int FROM documents"))
+                    total_docs = int(kb_cnt.scalar() or 0)
+                    if total_docs <= 0:
+                        return []
                     recent = (
                         await db.execute(
                             sa.text(
@@ -204,11 +180,88 @@ class VectorRetriever:
                             {"n": max(1, min(3, int(top_k)))},
                         )
                     ).mappings().all()
-                    ranked_rows = [dict(r) for r in recent]
-                    logger.warning(
-                        "Vector retrieval degraded",
-                        extra={"reason": "empty_after_all_fallbacks", "query": query, "fallback": "recent_docs"},
-                    )
+                    return [dict(r) for r in recent]
+            except Exception:
+                logger.warning(
+                    "Vector retrieval degraded",
+                    extra={"reason": "recent_docs_failed", "query": query},
+                )
+                return []
+
+        vec_rows, trigram_rows, kw_rows, recent_rows = await asyncio.gather(
+            _vector_strategy(),
+            _trigram_strategy(),
+            _keyword_strategy(),
+            _recent_strategy(),
+        )
+
+        # merge + dedupe (id first; then content hash), keep highest score
+        merged_by_id: dict[int, dict] = {}
+        for r in vec_rows:
+            rid = int(r["id"])
+            merged_by_id[rid] = {
+                "id": rid,
+                "title": r.get("title"),
+                "content": r.get("content") or "",
+                "source": r.get("source"),
+                "score": 0.65 * float(r.get("score") or 0.0),
+            }
+        for r in trigram_rows:
+            rid = int(r["id"])
+            weighted = 0.35 * float(r.get("score") or 0.0)
+            if rid in merged_by_id:
+                merged_by_id[rid]["score"] = max(float(merged_by_id[rid]["score"]), float(merged_by_id[rid]["score"]) + weighted)
+            else:
+                merged_by_id[rid] = {
+                    "id": rid,
+                    "title": r.get("title"),
+                    "content": r.get("content") or "",
+                    "source": r.get("source"),
+                    "score": weighted,
+                }
+        for r in kw_rows:
+            rid = int(r["id"])
+            if rid in merged_by_id:
+                merged_by_id[rid]["score"] = max(float(merged_by_id[rid]["score"]), 0.35)
+            else:
+                merged_by_id[rid] = {
+                    "id": rid,
+                    "title": r.get("title"),
+                    "content": r.get("content") or "",
+                    "source": r.get("source"),
+                    "score": float(r.get("score") or 0.35),
+                }
+        for r in recent_rows:
+            rid = int(r["id"])
+            if rid in merged_by_id:
+                merged_by_id[rid]["score"] = max(float(merged_by_id[rid]["score"]), float(r.get("score") or 0.15))
+            else:
+                merged_by_id[rid] = {
+                    "id": rid,
+                    "title": r.get("title"),
+                    "content": r.get("content") or "",
+                    "source": r.get("source"),
+                    "score": float(r.get("score") or 0.15),
+                }
+
+        # second-pass dedupe by content hash (avoid near-duplicate docs with different ids)
+        merged: list[dict] = []
+        seen_hash: dict[str, dict] = {}
+        for r in merged_by_id.values():
+            content = (r.get("content") or "").strip()
+            h = hashlib.sha1(content.encode("utf-8")).hexdigest() if content else f"id:{int(r['id'])}"
+            existing = seen_hash.get(h)
+            if existing is None or float(r.get("score") or 0.0) > float(existing.get("score") or 0.0):
+                seen_hash[h] = r
+        merged = list(seen_hash.values())
+
+        ranked_rows = sorted(merged, key=lambda x: float(x.get("score") or 0.0), reverse=True)
+
+        if not ranked_rows:
+            logger.warning(
+                "Vector retrieval degraded",
+                extra={"reason": "empty_after_all_strategies", "query": query, "fallback": "none"},
+            )
 
         final_rows = ranked_rows[: int(top_k)]
         return [

@@ -117,6 +117,14 @@
     return stars;
   }
 
+  var COLLAPSE_MS = 800;
+  var APPEAR_MS = 800;
+  // idle / hidden / 动画 共用：自转基速（_animateFrame 中按 appState 放大）
+  var SPIN_PLANET_IDLE = 0.004;
+  var SPIN_RING_IDLE = 0.0012;
+  var SPIN_STAR_IDLE = 0.0003;
+  var SPIN_MULT_ANALYZE = 4.5;
+
   function Galaxy() {
     this.scene = null;
     this.camera = null;
@@ -129,8 +137,12 @@
     this.isDown = false;
     this.rotX = 0.35;
     this.rotY = 0.6;
+    // idle | analyzing | collapsing | appearing | hidden
     this.appState = 'idle';
-    this.targetScale = 1;
+    this._collapseCallback = null;
+    this._appearCallback = null;
+    this._animStart = 0;
+    this._animDuration = 800;
     this.currentScale = 1;
     this.fade = 1;
     this._raf = null;
@@ -159,7 +171,7 @@
     el.style.top = '0';
     el.style.width = '100%';
     el.style.height = '100%';
-    el.style.zIndex = '1';
+    el.style.zIndex = '5';
     el.style.pointerEvents = 'none';
     document.body.appendChild(el);
     this.rootGroup = new THREE.Group();
@@ -285,39 +297,204 @@
     this._raf = null;
   };
 
+  Galaxy.prototype._applyGroupFade = function (t) {
+    this.fade = t;
+    if (this.planet && this.planet.material) this.planet.material.opacity = 0.95 * t;
+    if (this.ring && this.ring.material) this.ring.material.opacity = 0.65 * t;
+    if (this.ringGlow && this.ringGlow.material) this.ringGlow.material.opacity = 0.25 * t;
+  };
+
+  Galaxy.prototype.getAppState = function () {
+    return this.appState;
+  };
+
+  /** 立即回到空闲态（不播放动画）：用于错误 / 需补充信息等 */
+  Galaxy.prototype.setIdle = function setIdle() {
+    this._collapseCallback = null;
+    this._appearCallback = null;
+    this.appState = 'idle';
+    this.currentScale = 1;
+    this._applyGroupFade(1);
+    if (this.rootGroup) this.rootGroup.scale.set(1, 1, 1);
+    this._setCanvasClass(false);
+  };
+
+  /** 分析中：自转明显加速，保持完整尺度 */
+  Galaxy.prototype.setAnalyzing = function setAnalyzing() {
+    this._collapseCallback = null;
+    this._appearCallback = null;
+    this.appState = 'analyzing';
+    this.currentScale = 1;
+    this._applyGroupFade(1);
+    if (this.rootGroup) this.rootGroup.scale.set(1, 1, 1);
+    this._setCanvasClass(true);
+  };
+
+  /** 手动展开左侧大屏时：立即隐藏土星（不播放 0.8s 坍缩，避免与交互打架） */
+  Galaxy.prototype.hideForPanelOpen = function hideForPanelOpen() {
+    this._collapseCallback = null;
+    this._appearCallback = null;
+    this.appState = 'hidden';
+    this.currentScale = 0;
+    this._applyGroupFade(0);
+    if (this.rootGroup) this.rootGroup.scale.set(0.0001, 0.0001, 0.0001);
+    this._setCanvasClass(false);
+  };
+
+  /** 坍缩：固定 800ms 完整播完，再回调 */
+  Galaxy.prototype.playCollapse = function playCollapse(onComplete) {
+    if (this.appState === 'hidden' && this.currentScale < 0.02) {
+      this._setCanvasClass(false);
+      if (typeof onComplete === 'function') {
+        setTimeout(function () {
+          onComplete();
+        }, 0);
+      }
+      return;
+    }
+    this._collapseCallback = typeof onComplete === 'function' ? onComplete : null;
+    this._appearCallback = null;
+    this.appState = 'collapsing';
+    this._animStart = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+    this._animDuration = COLLAPSE_MS;
+    this._setCanvasClass(true);
+    if (!this._running) this.start();
+  };
+
+  /** 自隐藏状态回到空闲；若已在空闲则尽快回调 */
+  Galaxy.prototype.playAppear = function playAppear(onComplete) {
+    var done = typeof onComplete === 'function' ? onComplete : null;
+    this._collapseCallback = null;
+    this._setCanvasClass(false);
+    if (this.appState === 'idle' && this.currentScale > 0.92 && this.fade > 0.9) {
+      if (done) setTimeout(done, 0);
+      return;
+    }
+    this._appearCallback = done;
+    this.appState = 'appearing';
+    this._animStart = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+    this._animDuration = APPEAR_MS;
+    this.currentScale = 0.0001;
+    this._applyGroupFade(0);
+    if (this.rootGroup) this.rootGroup.scale.set(0.0001, 0.0001, 0.0001);
+    if (!this._running) this.start();
+  };
+
+  Galaxy.prototype._setCanvasClass = function (analyzing) {
+    var el = this.renderer && this.renderer.domElement;
+    if (!el) return;
+    if (analyzing) el.classList.add('galaxy-analyzing');
+    else el.classList.remove('galaxy-analyzing');
+  };
+
+  /** @deprecated 由 app 使用 setIdle / setAnalyzing / playAppear */
+  Galaxy.prototype.restoreVisuals = function restoreVisuals() {
+    this.setIdle();
+  };
+  /** @deprecated */
+  Galaxy.prototype.setLoading = function setLoading() {
+    this.setAnalyzing();
+  };
+  /** @deprecated */
+  Galaxy.prototype.setDone = function setDone() {
+    this.appState = 'hidden';
+    this.currentScale = 0;
+    this._applyGroupFade(0);
+    if (this.rootGroup) this.rootGroup.scale.set(0.0001, 0.0001, 0.0001);
+  };
+
+  Galaxy.prototype._easingCubicIn = function (t) {
+    return t * t * t;
+  };
+  Galaxy.prototype._easingCubicOut = function (t) {
+    return 1 - Math.pow(1 - t, 3);
+  };
+
   Galaxy.prototype._animateFrame = function _animateFrame() {
     if (!this.rootGroup) return;
     this.rootGroup.rotation.x = this.rotX;
     this.rootGroup.rotation.y = this.rotY;
-    // 回滚到最初版：更明显的“在转”
-    if (this.planet) this.planet.rotation.y += 0.004;
-    if (this.ring) this.ring.rotation.y += 0.0012;
-    if (this.ringGlow) this.ringGlow.rotation.y += 0.0012;
-    if (this.starField) this.starField.rotation.y += 0.0003;
-    // 思考阶段逐步收缩成一点；完成后保持小点，直到下一次提问时 restore。
-    this.currentScale += (this.targetScale - this.currentScale) * 0.010;
-    this.rootGroup.scale.set(this.currentScale, this.currentScale, this.currentScale);
-    if (this.appState === 'loading' && this.planet) this.planet.rotation.y += 0.0012;
-    this.renderer.render(this.scene, this.camera);
-  };
 
-  Galaxy.prototype.setLoading = function setLoading() {
-    this.appState = 'loading';
-    this.targetScale = 0.02;
-  };
-  Galaxy.prototype.setDone = function setDone() {
-    // 结果返回时保持收缩态，由 app.js 打开大屏承接视觉焦点
-    this.appState = 'done';
-    this.targetScale = 0.02;
-  };
-  Galaxy.prototype.restoreVisuals = function restoreVisuals() {
-    this.appState = 'idle';
-    this.targetScale = 1;
-    this.currentScale = Math.max(this.currentScale, 0.08);
-    this.fade = 1;
-    if (this.planet && this.planet.material) this.planet.material.opacity = 0.95;
-    if (this.ring && this.ring.material) this.ring.material.opacity = 0.65;
-    if (this.ringGlow && this.ringGlow.material) this.ringGlow.material.opacity = 0.25;
+    var mult = 1;
+    if (this.appState === 'analyzing' || this.appState === 'collapsing') {
+      mult = SPIN_MULT_ANALYZE;
+    }
+
+    var now = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+    if (this.appState === 'collapsing') {
+      var tc = (now - this._animStart) / this._animDuration;
+      if (tc >= 1) {
+        this.currentScale = 0;
+        this._applyGroupFade(0);
+        this.rootGroup.scale.set(0.0001, 0.0001, 0.0001);
+        this.appState = 'hidden';
+        this._setCanvasClass(false);
+        var cb0 = this._collapseCallback;
+        this._collapseCallback = null;
+        if (cb0) {
+          try {
+            cb0();
+          } catch (e) {}
+        }
+      } else {
+        var eIn = this._easingCubicIn(tc);
+        this.currentScale = 1 - eIn;
+        this._applyGroupFade(1 - tc);
+        var sc = Math.max(0.0001, this.currentScale);
+        this.rootGroup.scale.set(sc, sc, sc);
+        if (this.planet) this.planet.rotation.y += SPIN_PLANET_IDLE * mult;
+        if (this.ring) this.ring.rotation.y += SPIN_RING_IDLE * mult;
+        if (this.ringGlow) this.ringGlow.rotation.y += SPIN_RING_IDLE * mult;
+        if (this.starField) this.starField.rotation.y += SPIN_STAR_IDLE * (mult * 0.6);
+      }
+    } else if (this.appState === 'appearing') {
+      var ta = (now - this._animStart) / this._animDuration;
+      if (ta >= 1) {
+        this.appState = 'idle';
+        this.currentScale = 1;
+        this._applyGroupFade(1);
+        this.rootGroup.scale.set(1, 1, 1);
+        var cb1 = this._appearCallback;
+        this._appearCallback = null;
+        if (cb1) {
+          try {
+            cb1();
+          } catch (e) {}
+        }
+      } else {
+        var eOut = this._easingCubicOut(ta);
+        this.currentScale = eOut;
+        this._applyGroupFade(ta);
+        this.rootGroup.scale.set(eOut, eOut, eOut);
+        if (this.planet) this.planet.rotation.y += SPIN_PLANET_IDLE;
+        if (this.ring) this.ring.rotation.y += SPIN_RING_IDLE;
+        if (this.ringGlow) this.ringGlow.rotation.y += SPIN_RING_IDLE;
+        if (this.starField) this.starField.rotation.y += SPIN_STAR_IDLE;
+      }
+    } else {
+      if (this.appState === 'analyzing') {
+        if (this.planet) this.planet.rotation.y += SPIN_PLANET_IDLE * SPIN_MULT_ANALYZE;
+        if (this.ring) this.ring.rotation.y += SPIN_RING_IDLE * SPIN_MULT_ANALYZE;
+        if (this.ringGlow) this.ringGlow.rotation.y += SPIN_RING_IDLE * SPIN_MULT_ANALYZE;
+        if (this.starField) this.starField.rotation.y += SPIN_STAR_IDLE * 1.4;
+        this.currentScale = 1;
+        this._applyGroupFade(1);
+        this.rootGroup.scale.set(1, 1, 1);
+      } else if (this.appState === 'hidden') {
+        if (this.planet) this.planet.rotation.y += SPIN_PLANET_IDLE * 0.15;
+        if (this.ring) this.ring.rotation.y += SPIN_RING_IDLE * 0.15;
+        if (this.ringGlow) this.ringGlow.rotation.y += SPIN_RING_IDLE * 0.15;
+      } else {
+        if (this.planet) this.planet.rotation.y += SPIN_PLANET_IDLE;
+        if (this.ring) this.ring.rotation.y += SPIN_RING_IDLE;
+        if (this.ringGlow) this.ringGlow.rotation.y += SPIN_RING_IDLE;
+        if (this.starField) this.starField.rotation.y += SPIN_STAR_IDLE;
+        this.currentScale = 1;
+        this._applyGroupFade(1);
+        this.rootGroup.scale.set(1, 1, 1);
+      }
+    }
+    this.renderer.render(this.scene, this.camera);
   };
 
   window.GalaxyBackground = {

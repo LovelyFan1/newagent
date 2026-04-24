@@ -15,6 +15,64 @@ from app.services.vector_retriever import vector_retriever
 
 logger = logging.getLogger(__name__)
 
+# 本地 calculate_indicators / 评分引擎使用的名称（简称在库里常匹配不到 → 无评分 JSON）
+_INDICATOR_STOCK_NAME_MAP: dict[str, str] = {
+    "长城": "长城汽车",
+    "长安汽车": "长安汽车",
+    "长安": "长安汽车",
+    "广汽集团": "广汽集团",
+    "广汽": "广汽集团",
+    "比亚迪汽车": "比亚迪",
+    "比亚迪": "比亚迪",
+    "理想": "理想汽车",
+    "力帆": "力帆科技",
+    "力帆科技": "力帆科技",
+    "中汽": "中汽股份",
+    "中汽股份": "中汽股份",
+    "一汽解放": "一汽解放",
+    "万向": "万向钱潮",
+    "万向钱潮": "万向钱潮",
+    "东风汽车": "东风汽车",
+    "东风科技": "东风科技",
+    "重汽": "中国重汽",
+    "中国重汽": "中国重汽",
+    "宇通": "宇通客车",
+    "宇通客车": "宇通客车",
+    "江铃": "江铃汽车",
+    "江铃汽车": "江铃汽车",
+    "东安": "东安动力",
+    "东安动力": "东安动力",
+    "云意": "云意电气",
+    "云意电气": "云意电气",
+    "京威": "京威股份",
+    "京威股份": "京威股份",
+    "伯特利": "伯特利",
+    "信隆": "信隆健康",
+    "信隆健康": "信隆健康",
+    "旷达": "旷达科技",
+    "旷达科技": "旷达科技",
+    "汉马": "汉马科技",
+    "汉马科技": "汉马科技",
+    "索菱": "索菱股份",
+    "索菱股份": "索菱股份",
+    "贝斯特": "贝斯特",
+    "路畅": "路畅科技",
+    "路畅科技": "路畅科技",
+    "亚星": "亚星客车",
+    "亚星客车": "亚星客车",
+    "安凯": "安凯客车",
+    "安凯客车": "安凯客车",
+    "福田": "福田汽车",
+    "福田汽车": "福田汽车",
+}
+
+
+def _resolve_indicator_stock_name(name: str) -> str:
+    n = (name or "").strip()
+    if not n:
+        return n
+    return _INDICATOR_STOCK_NAME_MAP.get(n, n)
+
 
 class Evidence(BaseModel):
     evidence_id: str
@@ -34,9 +92,10 @@ class EvidenceRetriever:
         years = time_range.years(default_year=2022)
         tasks = []
         for ent in enterprises:
+            api_ent = _resolve_indicator_stock_name(ent)
             for y in years:
-                tasks.append(self._retrieve_local_indicators(ent, y))
-                tasks.append(self._retrieve_scoring(ent, y))
+                tasks.append(self._retrieve_local_indicators(api_ent, y))
+                tasks.append(self._retrieve_scoring(api_ent, y))
 
         results: list[list[Evidence]] = []
         if tasks:
@@ -145,9 +204,12 @@ class EvidenceRetriever:
             return []
         fin = data.get("indicators", {}).get("financial_health", {})
         legal = data.get("indicators", {}).get("legal_risk", {})
+        ind = data.get("indicators", {}).get("industry_position", {})
         excerpt = (
             f"{enterprise} {year} 指标摘要："
-            f"营收={fin.get('revenue')}, 净利润={fin.get('net_profit')}, 流动比率={fin.get('current_ratio')}; "
+            f"销量={ind.get('sales_volume')}, 新能源销量={ind.get('nev_sales_volume')}, "
+            f"营收={fin.get('revenue')}, 净利润={fin.get('net_profit')}, 总资产={fin.get('total_assets')}, "
+            f"ROE={fin.get('roe')}, 流动比率={fin.get('current_ratio')}; "
             f"诉讼次数={legal.get('lawsuit_count')}, 涉案金额={legal.get('lawsuit_total_amount')}。"
         )
         return [

@@ -32,6 +32,9 @@
   let currentSessionId = '';
   const DEFAULT_TIME_RANGE = '近3年';
   let userCollapsedChartThisSession = false;
+  let analysisStartTime = 0;
+  /** 分析阶段最短停留（与坍缩 800ms 独立）：避免接口极快时用户看不到“分析中” */
+  const MIN_ANALYZE_MS_BEFORE_COLLAPSE = 1000;
   let flowTimer = null;
   let flowStepIndex = 0;
   const FLOW_STEPS = [
@@ -52,6 +55,7 @@
   let currentEvidence = [];
   let isSending = false;
   let activeRequestId = 0;
+  let fullscreenCard = null;
 
   const galaxy = (function () {
     try {
@@ -168,24 +172,145 @@
     toggleChartBtn.textContent = collapsed ? '展开左侧' : '收起左侧';
   }
   function setChartCollapsed(collapsed, byUser) {
+    if (!chartPanel) return;
     localStorage.setItem('chartPanelCollapsed', collapsed ? '1' : '0');
     if (byUser) userCollapsedChartThisSession = !!collapsed;
     if (collapsed) {
       chartPanel.classList.remove('show');
-      if (galaxy) galaxy.restoreVisuals();
+      if (galaxy) galaxy.playAppear();
+    } else {
+      if (byUser && galaxy) galaxy.hideForPanelOpen();
+      chartPanel.classList.add('show');
     }
     syncChartButtons();
   }
 
-  function startLoading() {
-    // 新一轮追问：先收起大屏，回到土星主视觉，再进入收缩动画
-    chartPanel.classList.remove('show');
-    if (galaxy) {
-      galaxy.restoreVisuals();
-      setTimeout(function () {
-        if (galaxy) galaxy.setLoading();
-      }, 90);
+  /**
+   * 新一次分析前：若大屏已展开，必须先关闭，再让土星以 appear 出现，再进入分析中。
+   * 在 POST 发出之前通过 callback 进入后续逻辑（含设置 analysisStartTime）。
+   */
+  function prepareForNewQuery(next) {
+    if (typeof next !== 'function') return;
+    if (chartPanel && chartPanel.classList.contains('show')) {
+      chartPanel.classList.remove('show');
+      localStorage.setItem('chartPanelCollapsed', '1');
+      syncChartButtons();
+      if (galaxy) {
+        requestAnimationFrame(function () {
+          galaxy.playAppear(function () {
+            if (galaxy) galaxy.setAnalyzing();
+            next();
+          });
+        });
+      } else {
+        next();
+      }
+      return;
     }
+    if (galaxy) {
+      if (galaxy.getAppState && galaxy.getAppState() === 'hidden') {
+        galaxy.playAppear(function () {
+          if (galaxy) galaxy.setAnalyzing();
+          next();
+        });
+        return;
+      }
+      galaxy.setAnalyzing();
+    }
+    next();
+  }
+
+  function schedulePanelReveal(requestId) {
+    var wait = Math.max(0, MIN_ANALYZE_MS_BEFORE_COLLAPSE - (Date.now() - analysisStartTime));
+    setTimeout(function () {
+      if (requestId !== activeRequestId) return;
+      function doReveal() {
+        if (requestId !== activeRequestId) return;
+        if (!userCollapsedChartThisSession) {
+          setChartCollapsed(false, false);
+        }
+        adjustChartLayout();
+      }
+      if (!galaxy) {
+        doReveal();
+        return;
+      }
+      galaxy.playCollapse(function () {
+        doReveal();
+      });
+    }, wait);
+  }
+
+  function handleAgentQueryResult(result, requestId) {
+    if (requestId !== activeRequestId) return;
+    currentSessionId = result.session_id || currentSessionId;
+
+    if (result.status === 'needs_clarification') {
+      playFlowHint('问题解析完成，等待补充信息...');
+      const qs = (result.clarification && result.clarification.questions) || [];
+      append(
+        'bot',
+        '需要补充信息后才能继续：\n' +
+          qs
+            .map(function (q, i) {
+              return i + 1 + '. ' + q.question;
+            })
+            .join('\n')
+      );
+      finishFlowProgress('需补充信息').catch(function () {});
+      if (chartPanel) {
+        chartPanel.classList.remove('show');
+      }
+      localStorage.setItem('chartPanelCollapsed', '1');
+      syncChartButtons();
+      if (galaxy) galaxy.setIdle();
+      currentEvidence = result.evidence || [];
+      renderSources(currentEvidence);
+      agentStatus.textContent = '需补充信息';
+      return;
+    }
+
+    if (result.status === 'completed') {
+      if (downloadPdfBtn) {
+        downloadPdfBtn.style.display = 'inline-block';
+      } else {
+        console.warn('downloadPdfBtn 不存在，跳过显示');
+      }
+      if (!result.report || Object.keys(result.report).length === 0) {
+        if (agentError) agentError.textContent = '分析报告生成失败，请稍后重试或更换查询';
+        append('sys', '分析报告生成失败：report 为空');
+        if (galaxy) galaxy.setIdle();
+        finishFlowProgress('分析完成').catch(function () {});
+        currentEvidence = result.evidence || [];
+        renderSources(currentEvidence);
+        agentStatus.textContent = '响应完成';
+        return;
+      }
+    }
+
+    const answer = {};
+    if ((result.evidence || []).length > 0) {
+      playFlowHint('证据提取完成，正在生成结论...');
+    } else {
+      playFlowHint('正在整理分析结论...');
+    }
+    const sections = (result.report && result.report.sections) || {};
+    const isFastPath = sections.mode === 'simple_metric_fast_path';
+    if (isFastPath && result.charts) {
+      const directMetricText = buildFastPathMetricText(result.charts);
+      if (directMetricText) append('bot', directMetricText);
+      renderCharts(result.charts, answer);
+    } else {
+      renderReportMessage(result);
+    }
+    if (!isFastPath) {
+      finishLoading(answer, result.charts);
+    }
+    finishFlowProgress('分析完成').catch(function () {});
+    schedulePanelReveal(requestId);
+    currentEvidence = result.evidence || [];
+    renderSources(currentEvidence);
+    agentStatus.textContent = '响应完成';
   }
 
   function playFlowHint(text) {
@@ -376,13 +501,19 @@
     );
   }
 
-  function renderEChartsGauge(el, value) {
+  function renderEChartsGauge(el, gaugeInput) {
     if (!el || !window.echarts) return false;
-    const score = Math.max(0, Math.min(100, Number(value) || 0));
-    const chart = window.echarts.init(el, null, { renderer: 'canvas' });
+    var payload =
+      typeof gaugeInput === 'object' && gaugeInput !== null && !Array.isArray(gaugeInput)
+        ? gaugeInput
+        : { value: gaugeInput, rating: '', title: '综合评分' };
+    var score = Math.max(0, Math.min(100, Number(payload.value) || 0));
+    var titleText = payload.title ? String(payload.title) : '综合评分';
+    var ratingStr = payload.rating != null && payload.rating !== '' ? String(payload.rating) : '';
+    var chart = window.echarts.init(el, null, { renderer: 'canvas' });
     chart.setOption({
       backgroundColor: 'transparent',
-      title: { text: '综合评分', left: 12, top: 10, textStyle: { color: '#e5e7eb', fontSize: 14 } },
+      title: { text: titleText, left: 12, top: 10, textStyle: { color: '#e5e7eb', fontSize: 14 } },
       series: [
         {
           type: 'gauge',
@@ -398,7 +529,16 @@
           axisLabel: { color: 'rgba(255,255,255,.65)' },
           pointer: { show: true, length: '62%', width: 6 },
           anchor: { show: true, showAbove: true, size: 10, itemStyle: { color: CHART_THEME.primary } },
-          detail: { valueAnimation: true, formatter: '{value}', color: '#fff', fontSize: 26, offsetCenter: [0, '65%'] },
+          detail: {
+            valueAnimation: true,
+            formatter: function (val) {
+              var s = Number(val).toFixed(1);
+              return ratingStr ? s + ' · ' + ratingStr : s;
+            },
+            color: '#fff',
+            fontSize: 22,
+            offsetCenter: [0, '65%'],
+          },
           data: [{ value: Number(score.toFixed(1)) }],
         },
       ],
@@ -472,18 +612,51 @@
     const cards = Array.from(chartGrid.querySelectorAll('.chart-card'));
     if (cards.length === 1) {
       cards[0].classList.add('fullscreen-card');
+      cards[0].style.height = '80vh';
+      cards[0].style.width = '100%';
+      resizeCardChart(cards[0]);
       return;
     }
     cards.forEach(function (card) {
       card.classList.remove('fullscreen-card');
+      card.style.width = '';
+      card.style.height = '350px';
+      resizeCardChart(card);
     });
+  }
+
+  function resizeCardChart(card) {
+    if (!card) return;
+    const body = card.querySelector('.chart-card-body');
+    if (!body) return;
+    if (body.__chart__ && typeof body.__chart__.resize === 'function') {
+      body.__chart__.resize();
+    }
+  }
+
+  function toggleCardFullscreen(card) {
+    if (!card) return;
+    if (fullscreenCard && fullscreenCard !== card) {
+      fullscreenCard.classList.remove('chart-card-fullscreen');
+      resizeCardChart(fullscreenCard);
+      fullscreenCard = null;
+    }
+    const entering = !card.classList.contains('chart-card-fullscreen');
+    if (entering) {
+      card.classList.add('chart-card-fullscreen');
+      fullscreenCard = card;
+    } else {
+      card.classList.remove('chart-card-fullscreen');
+      if (fullscreenCard === card) fullscreenCard = null;
+    }
+    resizeCardChart(card);
   }
 
   // v2.2 enhancement compatibility: dynamic chart card creation.
   function createChartCard(title, badge) {
     const wrap = document.createElement('div');
     wrap.className = 'chart-card chart-box';
-    wrap.style.height = '320px';
+    wrap.style.height = '350px';
     const header = document.createElement('div');
     header.className = 'chart-card-header';
     header.style.display = 'flex';
@@ -495,9 +668,44 @@
       (badge ? '<span style="font-size:12px;color:#94a3b8;">' + escapeHtml(badge) + '</span>' : '');
     const body = document.createElement('div');
     body.className = 'chart-card-body';
-    body.style.height = '260px';
+    body.style.height = '290px';
+    const resizer = document.createElement('div');
+    resizer.className = 'chart-resizer';
+    let resizing = false;
+    let sx = 0;
+    let sy = 0;
+    let sw = 0;
+    let sh = 0;
+    resizer.addEventListener('mousedown', function (evt) {
+      evt.preventDefault();
+      evt.stopPropagation();
+      resizing = true;
+      sx = evt.clientX;
+      sy = evt.clientY;
+      sw = wrap.offsetWidth;
+      sh = wrap.offsetHeight;
+      document.body.style.userSelect = 'none';
+    });
+    window.addEventListener('mousemove', function (evt) {
+      if (!resizing) return;
+      const nextW = Math.max(400, sw + (evt.clientX - sx));
+      const nextH = Math.max(280, sh + (evt.clientY - sy));
+      wrap.style.width = nextW + 'px';
+      wrap.style.height = nextH + 'px';
+      body.style.height = Math.max(200, nextH - 60) + 'px';
+      resizeCardChart(wrap);
+    });
+    window.addEventListener('mouseup', function () {
+      if (!resizing) return;
+      resizing = false;
+      document.body.style.userSelect = '';
+    });
+    wrap.addEventListener('dblclick', function () {
+      toggleCardFullscreen(wrap);
+    });
     wrap.appendChild(header);
     wrap.appendChild(body);
+    wrap.appendChild(resizer);
     return { card: wrap, box: body };
   }
 
@@ -505,9 +713,16 @@
     if (!el || !window.echarts) return false;
     const inds = (radar && radar.indicators) || [];
     const series = (radar && radar.series) || [];
-    const first = series[0] || {};
-    const values = Array.isArray(first.value) ? first.value : [];
-    if (!inds.length || !values.length) {
+    const palette = [CHART_THEME.primary, CHART_THEME.secondary, CHART_THEME.accent, '#d6b97a', '#a78bfa'];
+    const radarData = series
+      .map(function (s, idx) {
+        const values = Array.isArray(s.value) ? s.value : [];
+        return { value: values, name: s.name || '企业' + (idx + 1), color: palette[idx % palette.length] };
+      })
+      .filter(function (d) {
+        return d.value.length > 0;
+      });
+    if (!inds.length || !radarData.length) {
       el.innerHTML = renderNoDataPlaceholder('雷达图', '暂无能力维度数据');
       return true;
     }
@@ -515,6 +730,10 @@
     chart.setOption({
       backgroundColor: 'transparent',
       title: { text: '综合能力雷达', left: 12, top: 10, textStyle: { color: '#e5e7eb', fontSize: 14 } },
+      legend:
+        radarData.length > 1
+          ? { top: 32, textStyle: { color: 'rgba(255,255,255,.75)' }, data: radarData.map(function (d) { return d.name; }) }
+          : undefined,
       radar: {
         indicator: inds.map(function (it) {
           if (typeof it === 'object') return { name: it.name || '-', max: it.max || 100 };
@@ -527,10 +746,15 @@
       series: [
         {
           type: 'radar',
-          data: [{ value: values, name: first.name || '综合' }],
-          areaStyle: { opacity: 0.18 },
-          lineStyle: { color: CHART_THEME.primary },
-          itemStyle: { color: CHART_THEME.primary },
+          data: radarData.map(function (d) {
+            return {
+              value: d.value,
+              name: d.name,
+              areaStyle: { opacity: 0.12 },
+              lineStyle: { color: d.color },
+              itemStyle: { color: d.color },
+            };
+          }),
         },
       ],
     });
@@ -562,18 +786,27 @@
     return true;
   }
 
-  function renderRankingBarChart(rankingBar, chartGrid) {
+  function renderRankingBarChart(rankingBar, chartGrid, cardTitle) {
     if (!chartGrid || !window.echarts) return false;
     const categories = (rankingBar && rankingBar.categories) || [];
     const series = (rankingBar && rankingBar.series) || [];
     if (!categories.length || !series.length) return false;
-    const c = createChartCard('综合排名（按总分降序）', 'comparison_ranking');
+    const ratings = (rankingBar && rankingBar.ratings) || [];
+    const c = createChartCard(cardTitle || '🏆 综合排名', 'comparison_ranking');
     chartGrid.appendChild(c.card);
     const inst = window.echarts.init(c.box, null, { renderer: 'canvas' });
     const values = Array.isArray(series[0].data) ? series[0].data : [];
     const barData = values.map(function (v, idx) {
+      var num = typeof v === 'object' && v !== null && 'value' in v ? Number(v.value) : Number(v);
+      var r =
+        (typeof v === 'object' && v !== null && v.rating != null && v.rating !== ''
+          ? String(v.rating)
+          : ratings[idx] != null
+            ? String(ratings[idx])
+            : '') || '';
       return {
-        value: v,
+        value: num,
+        rating: r,
         itemStyle: {
           color: idx === 0 ? '#d6b97a' : CHART_THEME.primary,
         },
@@ -581,10 +814,30 @@
     });
     inst.setOption({
       backgroundColor: 'transparent',
-      grid: { left: 70, right: 24, top: 16, bottom: 30, containLabel: true },
+      grid: { left: 70, right: 56, top: 16, bottom: 30, containLabel: true },
       xAxis: { type: 'value', axisLabel: { color: 'rgba(255,255,255,.65)' }, splitLine: { lineStyle: { color: 'rgba(255,255,255,.08)' } } },
       yAxis: { type: 'category', data: categories, axisLabel: { color: 'rgba(255,255,255,.72)' }, axisLine: { lineStyle: { color: 'rgba(255,255,255,.15)' } } },
-      series: [{ type: 'bar', data: barData }],
+      series: [
+        {
+          type: 'bar',
+          data: barData,
+          label: {
+            show: true,
+            position: 'right',
+            color: 'rgba(255,245,225,.92)',
+            formatter: function (params) {
+              var d = params.data;
+              var r = d && d.rating ? d.rating : '';
+              var val = d && typeof d.value !== 'undefined' ? d.value : params.value;
+              var num = Number(val);
+              if ((!num && num !== 0) || (num === 0 && (!r || r === '-'))) {
+                return '暂无本地评分';
+              }
+              return r ? num + '  ' + r : String(num);
+            },
+          },
+        },
+      ],
       tooltip: { trigger: 'axis' },
     });
     return true;
@@ -594,7 +847,8 @@
     if (!window.echarts) return false;
     const chartGrid = getChartGrid();
     if (!chartGrid) return false;
-    const c = createChartCard('指标趋势', 'simple_metric');
+    const metricName = metricDisplayName(metricSeries.metric);
+    const c = createChartCard('📈 ' + metricName + '趋势', 'simple_metric');
     chartGrid.appendChild(c.card);
     const categories = Array.isArray(metricSeries.categories) ? metricSeries.categories : [];
     const s0 = (metricSeries.series && metricSeries.series[0]) || { name: '指标', data: [] };
@@ -718,15 +972,49 @@
       adjustChartLayout();
       return;
     }
+    if (chartType === 'analysis') {
+      const radarCard = createChartCard('📊 综合能力雷达', 'analysis_radar');
+      chartGrid.appendChild(radarCard.card);
+      renderRadarChart(radarCard.box, (charts && charts.radar) || {});
+      const scatterCard = createChartCard('🎯 风险-收益散点', 'analysis_scatter');
+      chartGrid.appendChild(scatterCard.card);
+      renderEChartsScatter(scatterCard.box, (charts && charts.scatter) || {});
+      var g = charts && charts.gauge;
+      if (g && typeof g === 'object' && Number.isFinite(Number(g.value))) {
+        const gaugeCard = createChartCard(String(g.title || '综合评分'), 'analysis_gauge');
+        chartGrid.appendChild(gaugeCard.card);
+        renderEChartsGauge(gaugeCard.box, g);
+      }
+      adjustChartLayout();
+      return;
+    }
+    if (chartType === 'ranking') {
+      const barPayload = charts && charts.bar;
+      if (barPayload && Array.isArray(barPayload.categories) && barPayload.categories.length) {
+        const rb = {
+          categories: barPayload.categories,
+          series: barPayload.series && barPayload.series.length ? barPayload.series : [{ name: '指标', data: [] }],
+          ratings: barPayload.ratings || [],
+        };
+        const ct = barPayload.metric_title ? '📊 ' + String(barPayload.metric_title) : '📊 排行榜';
+        renderRankingBarChart(rb, chartGrid, ct);
+      } else {
+        const rc = createChartCard('📊 排行榜', 'ranking');
+        chartGrid.appendChild(rc.card);
+        rc.box.innerHTML = renderNoDataPlaceholder('排行榜', '暂无可展示的排行数据，请补充企业范围或稍后重试');
+      }
+      adjustChartLayout();
+      return;
+    }
     if (chartType === 'comparison_ranking') {
       if (charts && charts.ranking_bar) renderRankingBarChart(charts.ranking_bar, chartGrid);
       if (charts && charts.radar) {
-        const rc = createChartCard('综合能力雷达', 'comparison_radar');
+        const rc = createChartCard('🕸️ 综合能力雷达', 'comparison_radar');
         chartGrid.appendChild(rc.card);
         renderRadarChart(rc.box, charts.radar);
       }
       if (charts && charts.scatter) {
-        const sc = createChartCard('风险-收益散点', 'scatter');
+        const sc = createChartCard('🎯 风险-收益散点', 'scatter');
         chartGrid.appendChild(sc.card);
         renderEChartsScatter(sc.box, charts.scatter);
       }
@@ -734,37 +1022,32 @@
       return;
     }
     if (chartType === 'legal_risk') {
-      if (charts && charts.stacked_bar) {
-        const sc = createChartCard('司法案件结构', 'stacked_bar');
-        chartGrid.appendChild(sc.card);
-        renderStackedBar(sc.box, charts.stacked_bar);
-      }
-      if (charts && charts.heatmap) {
-        const hc = createChartCard('司法风险热力', 'heatmap');
-        chartGrid.appendChild(hc.card);
-        renderHeatmap(hc.box, charts.heatmap);
-      }
+      const legalCard = createChartCard('⚖️ 司法风险分析', 'legal_risk');
+      chartGrid.appendChild(legalCard.card);
+      legalCard.box.style.display = 'grid';
+      legalCard.box.style.gridTemplateColumns = '1fr 1fr';
+      legalCard.box.style.gap = '10px';
+      const stackedEl = document.createElement('div');
+      stackedEl.style.height = '100%';
+      const heatmapEl = document.createElement('div');
+      heatmapEl.style.height = '100%';
+      legalCard.box.innerHTML = '';
+      legalCard.box.appendChild(stackedEl);
+      legalCard.box.appendChild(heatmapEl);
+      renderStackedBar(stackedEl, (charts && charts.stacked_bar) || {});
+      renderHeatmap(heatmapEl, (charts && charts.heatmap) || {});
       adjustChartLayout();
       return;
     }
     if (chartType === 'sentiment') {
-      const sentimentCard = createChartCard('舆情与风险摘要', 'sentiment');
+      const sentimentCard = createChartCard('📰 舆情分析', 'sentiment');
       chartGrid.appendChild(sentimentCard.card);
-      const blocks = [];
-      if (charts && charts.wordcloud) {
-        blocks.push(renderWordcloud(charts.wordcloud));
+      if (charts && charts.line && Array.isArray(charts.line.categories) && charts.line.categories.length) {
+        renderLineChart(sentimentCard.box, charts.line);
+      } else {
+        var sHint = (charts && charts.sentiment_hint) || '暂无舆情数据可视化';
+        sentimentCard.box.innerHTML = renderNoDataPlaceholder('舆情分析', String(sHint));
       }
-      if (answer && Array.isArray(answer.key_findings) && answer.key_findings.length) {
-        blocks.push(
-          '<div class="chart-box"><h3 style="margin:0 0 8px 0;">舆情要点</h3><p style="margin:0;color:#d1d5db;">' +
-            answer.key_findings.slice(0, 5).map(escapeHtml).join('<br>') +
-            '</p></div>'
-        );
-      }
-      if (!blocks.length) {
-        blocks.push(renderNoDataPlaceholder('舆情分析', '当前查询未返回可视化舆情数据'));
-      }
-      sentimentCard.box.innerHTML = blocks.join('');
       adjustChartLayout();
       return;
     }
@@ -794,12 +1077,12 @@
       renderRankingBarChart(charts.ranking_bar, chartGrid);
     }
     if (charts && charts.bar && Array.isArray(charts.bar.categories) && charts.bar.categories.length) {
-      const barCard = createChartCard('对比柱状图', 'bar');
+      const barCard = createChartCard('📊 对比柱状图', 'bar');
       chartGrid.appendChild(barCard.card);
       renderBarChart(barCard.box, charts.bar);
     }
     if (charts && charts.line && Array.isArray(charts.line.categories) && charts.line.categories.length) {
-      const lineCard = createChartCard('趋势折线', 'line');
+      const lineCard = createChartCard('📈 趋势折线', 'line');
       chartGrid.appendChild(lineCard.card);
       renderLineChart(lineCard.box, charts.line);
     }
@@ -883,7 +1166,6 @@
   }
 
   function finishLoading(answer, charts) {
-    if (galaxy) galaxy.setDone();
     renderCharts(charts, answer);
   }
 
@@ -1020,99 +1302,50 @@
     sendBtn.disabled = true;
     isSending = true;
     const requestId = ++activeRequestId;
-    startLoading();
     startFlowProgress();
 
-    var task = Promise.resolve();
-    if (question.indexOf('评分') >= 0) {
-      const parsed = extractStockCodeAndYear(question);
-      task = window.apiClient.getScoring(parsed.stockCode, parsed.year).then(function (scoring) {
-        if (requestId !== activeRequestId) return;
-        renderScoringCard(scoring);
-        agentStatus.textContent = '评分完成';
-      });
-    } else {
-      task = window.apiClient.postAgentQuery(question, currentSessionId || null).then(function (result) {
-        if (requestId !== activeRequestId) return;
-        currentSessionId = result.session_id || currentSessionId;
-        if (result.status === 'completed') {
-          if (downloadPdfBtn) {
-            downloadPdfBtn.style.display = 'inline-block';
-          } else {
-            console.warn('downloadPdfBtn 不存在，跳过显示');
-          }
-          if (!result.report || Object.keys(result.report).length === 0) {
-            if (agentError) agentError.textContent = '分析报告生成失败，请稍后重试或更换查询';
-            append('sys', '分析报告生成失败：report 为空');
-          }
-        }
-        if (result.status === 'needs_clarification') {
-          playFlowHint('问题解析完成，等待补充信息...');
-          const qs = (result.clarification && result.clarification.questions) || [];
-          append(
-            'bot',
-            '需要补充信息后才能继续：\n' +
-              qs
-                .map(function (q, i) {
-                  return i + 1 + '. ' + q.question;
-                })
-                .join('\n')
-          );
-          finishFlowProgress('需补充信息').catch(function () {});
-          chartPanel.classList.remove('show');
-          if (galaxy) galaxy.restoreVisuals();
-        } else {
-          const answer = {};
-          if ((result.evidence || []).length > 0) {
-            playFlowHint('证据提取完成，正在生成结论...');
-          } else {
-            playFlowHint('正在整理分析结论...');
-          }
-          const sections = (result.report && result.report.sections) || {};
-          const isFastPath = sections.mode === 'simple_metric_fast_path';
-          if (isFastPath && result.charts) {
-            const directMetricText = buildFastPathMetricText(result.charts);
-            if (directMetricText) append('bot', directMetricText);
-            renderCharts(result.charts, answer);
-          } else {
-            renderReportMessage(result);
-          }
-          // 若 answer 缺失或过短，使用 report.summary 做展示兜底
-          try {
-            const aText = (answer && (answer.user_facing_reply || answer.summary)) || '';
-            const rSum = (result.report && result.report.summary) || '';
-            if (!isFastPath && (!aText || String(aText).trim().length < 6) && rSum) {
-              append('bot', '报告摘要：' + rSum);
-            }
-          } catch (_) {}
-          if (!isFastPath) finishLoading(answer, result.charts);
-          finishFlowProgress('分析完成').then(function () {
-            if (!userCollapsedChartThisSession) {
-              setChartCollapsed(false, false);
-              chartPanel.classList.add('show');
-            }
-          });
-        }
-        currentEvidence = result.evidence || [];
-        renderSources(currentEvidence);
-        agentStatus.textContent = '响应完成';
-      });
-    }
-
-    task
-      .catch(function (e) {
-        finishFlowProgress('分析中断').catch(function () {});
-        append('sys', '执行失败：' + e.message);
-        agentError.textContent = '执行失败：' + e.message;
-        showToast(e.message, 'error');
-        agentStatus.textContent = '';
-        chartPanel.classList.remove('show');
-        if (galaxy) galaxy.restoreVisuals();
-      })
-      .finally(function () {
+    prepareForNewQuery(function onReadyForRequest() {
+      if (requestId !== activeRequestId) {
         sendBtn.disabled = false;
         isSending = false;
-      });
+        return;
+      }
+      analysisStartTime = Date.now();
+      var task;
+      if (question.indexOf('评分') >= 0) {
+        const parsed = extractStockCodeAndYear(question);
+        task = window.apiClient.getScoring(parsed.stockCode, parsed.year).then(function (scoring) {
+          if (requestId !== activeRequestId) return;
+          renderScoringCard(scoring);
+          agentStatus.textContent = '评分完成';
+          finishFlowProgress('分析完成').catch(function () {});
+          schedulePanelReveal(requestId);
+        });
+      } else {
+        task = window.apiClient.postAgentQuery(question, currentSessionId || null).then(function (result) {
+          if (requestId !== activeRequestId) return;
+          handleAgentQueryResult(result, requestId);
+        });
+      }
+
+      task.catch(function (e) {
+          finishFlowProgress('分析中断').catch(function () {});
+          append('sys', '执行失败：' + e.message);
+          agentError.textContent = '执行失败：' + e.message;
+          showToast(e.message, 'error');
+          agentStatus.textContent = '';
+          if (chartPanel) {
+            chartPanel.classList.remove('show');
+          }
+          localStorage.setItem('chartPanelCollapsed', '1');
+          syncChartButtons();
+          if (galaxy) galaxy.setIdle();
+        })
+        .finally(function () {
+          sendBtn.disabled = false;
+          isSending = false;
+        });
+    });
   }
 
   sendBtn.addEventListener('click', sendMsg);
@@ -1129,7 +1362,9 @@
     agentStatus.textContent = '已新建会话，请输入新问题';
     agentError.textContent = '';
     chartPanel.classList.remove('show');
-    if (galaxy) galaxy.restoreVisuals();
+    localStorage.setItem('chartPanelCollapsed', '1');
+    syncChartButtons();
+    if (galaxy) galaxy.setIdle();
   });
 
   logoutBtn.addEventListener('click', function () {
@@ -1156,36 +1391,34 @@
   });
 
   toggleChartBtn.addEventListener('click', function () {
-    const collapsed = isChartCollapsed();
-    if (collapsed) {
-      setChartCollapsed(false, true);
-      chartPanel.classList.add('show');
-    } else {
-      setChartCollapsed(true, true);
-      chartPanel.classList.remove('show');
-    }
+    if (!chartPanel) return;
+    setChartCollapsed(!isChartCollapsed(), true);
   });
   collapseChartBtn.addEventListener('click', function () {
-    const collapsed = isChartCollapsed();
-    if (collapsed) {
-      setChartCollapsed(false, true);
-      chartPanel.classList.add('show');
-    } else {
-      setChartCollapsed(true, true);
-      chartPanel.classList.remove('show');
-    }
+    if (!chartPanel) return;
+    setChartCollapsed(!isChartCollapsed(), true);
   });
-
-  if (isChartCollapsed()) {
-    chartPanel.classList.remove('show');
-    setTimeout(function () {
-      if (galaxy) galaxy.restoreVisuals();
-    }, 0);
-    userCollapsedChartThisSession = false;
-  } else {
-    // 未折叠时默认展示左侧大屏，避免用户误以为“没有可视化”
-    chartPanel.classList.add('show');
+  if (chartPanel) {
+    chartPanel.addEventListener('dblclick', function (e) {
+      if (e.target.closest('button, .chart-tools, .chart-head')) return;
+      if (!chartPanel.classList.contains('show')) return;
+      setChartCollapsed(true, true);
+    });
   }
+
+  if (localStorage.getItem('chartPanelCollapsed') === null) {
+    localStorage.setItem('chartPanelCollapsed', '1');
+  }
+  if (chartPanel) {
+    if (isChartCollapsed()) {
+      chartPanel.classList.remove('show');
+      if (galaxy) galaxy.setIdle();
+    } else {
+      chartPanel.classList.add('show');
+      if (galaxy) galaxy.hideForPanelOpen();
+    }
+  }
+  userCollapsedChartThisSession = false;
   syncChartButtons();
   function uploadFile(file) {
     if (!file) return;
@@ -1194,7 +1427,7 @@
     }
     if (agentStatus) agentStatus.textContent = '文件上传中...';
     return window.apiClient
-      .uploadFile(file)
+      .uploadFile(file, currentSessionId || null)
       .then(function (data) {
         currentSessionId = data.session_id || currentSessionId;
         const text = '已上传文件：' + (data.filename || file.name) + '，请告诉我你想分析的内容。';
@@ -1245,7 +1478,7 @@
   if (downloadPdfBtn) {
     downloadPdfBtn.addEventListener('click', function () {
       if (!currentSessionId) return;
-      window.open('/api/v1/files/download_report/' + encodeURIComponent(currentSessionId), '_blank');
+      window.open('/api/v1/report/download/' + encodeURIComponent(currentSessionId), '_blank');
     });
   } else {
     console.warn('downloadPdfBtn 不存在，PDF下载按钮未挂载');
@@ -1273,6 +1506,13 @@
   window.addEventListener('resize', function () {
     adjustChartLayout();
   });
+  window.addEventListener('keydown', function (evt) {
+    if (evt.key === 'Escape' && fullscreenCard) {
+      fullscreenCard.classList.remove('chart-card-fullscreen');
+      resizeCardChart(fullscreenCard);
+      fullscreenCard = null;
+    }
+  });
   initMe();
-  append('sys', '欢迎使用。你可连续追问，系统会复用当前会话上下文。');
+  append('sys', '欢迎使用，请直接输入企业问题。');
 })();

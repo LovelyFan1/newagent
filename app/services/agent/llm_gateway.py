@@ -86,6 +86,14 @@ class LLMGateway:
                     ),
                     timeout=call_timeout,
                 )
+                logger.warning(
+                    "[LLM RAW RESPONSE] status=%s",
+                    getattr(resp.choices[0], "finish_reason", None) if getattr(resp, "choices", None) else None,
+                )
+                logger.warning(
+                    "[LLM RAW CONTENT] <<<%s>>>",
+                    (resp.choices[0].message.content if getattr(resp, "choices", None) else None),
+                )
                 content = (resp.choices[0].message.content or "").strip()
                 usage = getattr(resp, "usage", None)
                 result = LLMResult(

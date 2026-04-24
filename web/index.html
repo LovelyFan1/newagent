@@ -3,13 +3,13 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>汽车金融分析智能体</title>
-<link rel="stylesheet" href="./css/dashboard.css?v=20260423_layout_1">
+<title>新能源汽车金融分析智能体</title>
+<link rel="stylesheet" href="./css/dashboard.css?v=20260424_galaxy_flow">
 <style>
 body{margin:0;overflow:hidden;background:black;font-family:Arial;}
 .title{position:fixed;left:30px;top:20px;color:#fff;font-size:18px;opacity:.85;z-index:20;}
 .chat-box{
-  position:fixed;right:15px;top:20px;bottom:20px;width:390px;z-index:20;
+  position:fixed;right:15px;top:20px;bottom:20px;width:480px;z-index:20;
   background:rgba(18,18,18,.55);backdrop-filter:blur(25px);-webkit-backdrop-filter:blur(25px);
   border-radius:20px;border:1px solid rgba(255,255,255,.08);
   box-shadow:0 0 40px rgba(255,255,255,.06), inset 0 0 20px rgba(255,255,255,.03);
@@ -27,7 +27,7 @@ body{margin:0;overflow:hidden;background:black;font-family:Arial;}
 }
 .chat-status{padding:6px 12px 0;min-height:16px;font-size:11px;color:#90f4bf;}
 .chat-error{padding:2px 12px 0;min-height:16px;font-size:11px;color:#ff9f9f;}
-.chat-content{flex:1;padding:12px;overflow:auto;color:#ddd;font-size:13px;line-height:1.6;}
+.chat-content{flex:1;padding:12px;overflow:auto;color:#ddd;font-size:15px;line-height:1.6;}
 .chat-content{scrollbar-width:thin;scrollbar-color:rgba(214,185,122,.55) rgba(255,255,255,.06);}
 .chat-content::-webkit-scrollbar{width:10px;height:10px;}
 .chat-content::-webkit-scrollbar-track{background:rgba(255,255,255,.06);border-radius:999px;}
@@ -57,14 +57,19 @@ body{margin:0;overflow:hidden;background:black;font-family:Arial;}
 .evidence-body::-webkit-scrollbar-thumb{background:rgba(214,185,122,.55);border:2px solid rgba(10,10,15,.94);border-radius:999px;}
 .evidence-body::-webkit-scrollbar-thumb:hover{background:rgba(214,185,122,.75);}
 #chartPanel{
-  position:fixed;left:-60%;top:0;bottom:0;width:60%;
+  position:fixed;left:0;right:510px;top:0;bottom:0;width:auto;
   /* 让背景“土星”透出：降低遮罩不透明度 */
   background:rgba(10,10,15,.35);
   backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);
-  color:#fff;padding:40px;box-sizing:border-box;transition:all 1s ease;opacity:0;z-index:15;
+  color:#fff;padding:32px;box-sizing:border-box;
+  display:flex;flex-direction:column;
+  transform:translateX(-102%);
+  transition:transform 1s ease, opacity 1s ease;
+  opacity:0;z-index:15;
 }
-#chartPanel.show{left:0;opacity:1;}
-.chart-head{display:flex;align-items:center;justify-content:space-between;gap:12px;}
+#chartPanel.show{transform:translateX(0);opacity:1;}
+#chartContent{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;}
+.chart-head{flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;gap:12px;}
 .chart-head h2{margin:0;}
 .chart-tools{display:flex;gap:8px;align-items:center;}
 .chart-tools button{border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);color:#ddd;font-size:12px;padding:6px 10px;border-radius:10px;cursor:pointer;}
@@ -76,6 +81,7 @@ body{margin:0;overflow:hidden;background:black;font-family:Arial;}
   border:1px solid rgba(255,255,255,.08);
   box-shadow:0 0 30px rgba(0,0,0,.25);
 }
+#chartGrid{flex:1;min-height:0;}
 #flowHint{
   position:fixed;left:28%;top:17%;transform:translateX(-50%) scale(1);
   z-index:16;pointer-events:none;opacity:0;
@@ -92,11 +98,15 @@ body{margin:0;overflow:hidden;background:black;font-family:Arial;}
   35%{transform:scale(.86);opacity:1;filter:brightness(1.26);}
   100%{transform:scale(1);opacity:.95;filter:brightness(1);}
 }
-@media (max-width:900px){.chat-box{left:12px;right:12px;top:12px;bottom:12px;width:auto;}.evidence-panel{left:12px;right:12px;width:auto;}}
+@media (max-width:900px){
+  .chat-box{left:12px;right:12px;top:12px;bottom:12px;width:auto;}
+  .evidence-panel{left:12px;right:12px;width:auto;}
+  #chartPanel{right:0;}
+}
 </style>
 </head>
 <body>
-<div class="title">汽车金融分析智能体</div>
+<div class="title">新能源汽车金融分析智能体</div>
 <div id="flowHint" aria-live="polite" aria-atomic="true"><span id="flowHintText">分析准备中...</span></div>
 <div id="chartPanel">
   <div class="chart-head">
@@ -106,10 +116,7 @@ body{margin:0;overflow:hidden;background:black;font-family:Arial;}
     </div>
   </div>
   <div id="chartContent">
-    <!-- ECharts 挂载容器：投资意图用仪表盘 + 散点图 -->
-    <div id="gaugeChart" class="chart-box" style="height:260px;"></div>
-    <div id="scatterChart" class="chart-box" style="height:340px;"></div>
-    <!-- 文本/简易图表兜底区域 -->
+    <!-- 动态图表由 app.js 注入 #chartGrid；不再保留未使用的静态占位，以免长期显示两块空屏 -->
     <div id="chartTextBlocks"></div>
   </div>
 </div>
@@ -132,19 +139,19 @@ body{margin:0;overflow:hidden;background:black;font-family:Arial;}
     <div class="evidence-body" id="sourcePanel">暂无证据</div>
   </div>
   <div class="chat-input">
-    <button id="uploadBtn" class="upload-btn" type="button">上传文件</button>
+    <button id="uploadBtn" class="upload-btn" type="button">📎 上传文件</button>
     <input id="input" placeholder="猜你想问：比亚迪近一年销量如何？蔚来近三年财报怎么样？" autocomplete="off">
     <button id="sendBtn" type="button">↑</button>
   </div>
-  <input id="fileInput" type="file" style="display:none" accept=".pdf,.doc,.docx,.xlsx,.xls,.csv,.txt">
-  <div style="padding:0 12px 10px;color:#9fc7ff;font-size:11px;">支持拖拽 Word/Excel/CSV/TXT/PDF 到输入框区域上传</div>
+  <input id="fileInput" type="file" style="display:none" accept=".pdf,.docx,.csv,.txt">
+  <div style="padding:0 12px 10px;color:#9fc7ff;font-size:11px;">支持拖拽 DOCX/CSV/TXT/PDF 到输入框区域上传</div>
   <div style="padding:0 12px 12px;"><button id="downloadPdfBtn" type="button" style="display:none;border:1px solid rgba(255,255,255,.2);background:rgba(255,255,255,.08);color:#fff;padding:8px 10px;border-radius:8px;cursor:pointer;">📄 下载PDF报告</button></div>
 </div>
 <script src="./vendor/three.min.js?v=20260422"></script>
 <script src="./vendor/echarts.min.js?v=20260422"></script>
-<script src="./js/galaxy.js?v=20260422_1"></script>
+<script src="./js/galaxy.js?v=20260424_flow_1"></script>
 <script>window.API_BASE_URL = window.API_BASE_URL || '';</script>
 <script src="./js/api-client.js?v=20260423_generic_fix&t=20260423_235500"></script>
-<script src="./js/app.js?v=final_clean_3&t=20260424_003000"></script>
+<script src="./js/app.js?v=charts_ent_alias_20260424&t=20260424_160000"></script>
 </body>
 </html>

@@ -7,7 +7,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from app.services.agent.evidence import Evidence
-from app.services.agent.llm_gateway import LLMGateway, default_llm_gateway
+from app.services.agent.intent import IntentDetector
+from app.services.agent.llm_gateway import LLMCallError, LLMGateway, LLMTimeoutError, default_llm_gateway
 from app.services.agent.utils import extract_json_object, safe_text
 
 
@@ -120,6 +121,7 @@ def build_comparison_snapshot_from_evidence(enterprises: list[str], evidence: li
     return {
         "enterprises": sorted_enterprises,
         "scores": scores,
+        "ratings": [str(r.get("rating") or "-") for r in snapshot_rows],
         "metrics": metrics,
         "data": data,
         "table_markdown": build_comparison_table(sorted_enterprises, metrics, data),
@@ -170,18 +172,30 @@ class ResponseComposer:
 
         if intent == "chat":
             if self.llm.enabled:
-                r = await self.llm.chat(
-                    system="你是简洁的中文助手，控制在120字以内。",
-                    user=query,
-                    temperature=0.3,
-                )
-                return AgentResponse(
-                    status="completed",
-                    report=EnhancedReport(summary=safe_text(r.content, 280), sections={"mode": "chat"}),
-                    clarification=ClarificationBlock(required=False, questions=[]),
-                    evidence=[],
-                    charts={},
-                )
+                try:
+                    r = await self.llm.chat(
+                        system="你是简洁的中文助手，控制在120字以内。",
+                        user=query,
+                        temperature=0.3,
+                    )
+                    return AgentResponse(
+                        status="completed",
+                        report=EnhancedReport(summary=safe_text(r.content, 280), sections={"mode": "chat"}),
+                        clarification=ClarificationBlock(required=False, questions=[]),
+                        evidence=[],
+                        charts={},
+                    )
+                except (LLMTimeoutError, LLMCallError):
+                    return AgentResponse(
+                        status="completed",
+                        report=EnhancedReport(
+                            summary="我已理解你的追问。基于上一轮上下文，建议补充更具体对象或年份后继续分析。",
+                            sections={"mode": "chat_timeout_fallback"},
+                        ),
+                        clarification=ClarificationBlock(required=False, questions=[]),
+                        evidence=[],
+                        charts={"chart_type": "general"},
+                    )
             return AgentResponse(
                 status="completed",
                 report=EnhancedReport(
@@ -214,6 +228,21 @@ class ResponseComposer:
             q = (query or "").strip()
             is_sentiment_query = bool(re.search(r"(舆情|新闻|口碑|舆论)", q))
             is_comparison_query = len(enterprises) > 1 and bool(re.search(r"(对比|比较|vs|VS|哪个好|谁更|高于|低于|排名)", q, flags=re.IGNORECASE))
+            is_ranking_query = bool(
+                re.search(
+                    r"(哪些企业|哪家公司|哪几家|谁家|谁\b|哪些公司|企业有哪些|公司有哪些|有哪些企业|有哪些公司|"
+                    r"排行榜|排行|排名|排序|前几|top\s*\d|TOP\d|前三|前五|前十|最高|最低|最多|最少|低于|高于|不足)",
+                    q,
+                    flags=re.IGNORECASE,
+                )
+            ) and bool(
+                re.search(
+                    r"(ROE|roe|净资产收益率|销量|营收|净利润|诉讼|案件|司法|评分|综合|负债|资产|市值|利润|排名|排序|"
+                    r"流动比率|财务压力|司法风险)",
+                    q,
+                    flags=re.IGNORECASE,
+                )
+            )
 
             # Backend hint for frontend: decide which charts to render.
             mode = str(sections.get("mode") or "")
@@ -223,7 +252,9 @@ class ResponseComposer:
                 charts["chart_type"] = "sentiment"
             elif is_comparison_query:
                 charts["chart_type"] = "comparison_ranking"
-            elif re.search(r"(司法|诉讼|仲裁|案件|判决|执行|行政处罚)", q):
+            elif is_ranking_query:
+                charts["chart_type"] = "ranking"
+            elif intent == "legal_risk" or re.search(r"(司法|诉讼|仲裁|案件|判决|执行|行政处罚)", q):
                 charts["chart_type"] = "legal_risk"
             else:
                 charts["chart_type"] = "general" if intent == "sentiment" else (intent or "analysis")
@@ -231,6 +262,8 @@ class ResponseComposer:
             if intent == "sentiment" or is_sentiment_query:
                 # Hard guard: sentiment intent must not produce ranking/table/recommend-invest artifacts.
                 charts["chart_type"] = "sentiment"
+                sentiment_line = self._build_sentiment_line_from_evidence(enterprises=enterprises, evidence=evidence)
+                charts["line"] = sentiment_line or {}
                 key_findings = sections.get("key_findings") if isinstance(sections.get("key_findings"), list) else []
                 sections["key_findings"] = [
                     item for item in key_findings if not (isinstance(item, str) and "| 指标 |" in item)
@@ -242,6 +275,9 @@ class ResponseComposer:
                     if not (isinstance(r, str) and re.search(r"(推荐投资|买入|加仓|第一值得投资)", r))
                 ]
                 report.summary = re.sub(r"(第一值得投资的是.*)$", "", report.summary or "").strip() or "已完成舆情分析。"
+                if not sentiment_line:
+                    sections["sentiment_chart_hint"] = "暂无舆情数据可视化"
+                charts["sentiment_hint"] = sections.get("sentiment_chart_hint") or "暂无舆情数据可视化"
                 report.sections = sections
                 return AgentResponse(
                     status="completed",
@@ -288,9 +324,17 @@ class ResponseComposer:
                 if snapshot_for_charts:
                     cats = list(snapshot_for_charts.get("enterprises") or [])
                     vals = list(snapshot_for_charts.get("scores") or [])
+                    ratings_row = list(snapshot_for_charts.get("ratings") or [])
+                    rank_items: list[dict[str, Any]] = []
+                    for i, v in enumerate(vals):
+                        item: dict[str, Any] = {"value": float(v) if isinstance(v, (int, float)) else 0.0}
+                        if i < len(ratings_row):
+                            item["rating"] = ratings_row[i]
+                        rank_items.append(item)
                     charts["ranking_bar"] = {
                         "categories": cats,
-                        "series": [{"name": "综合评分", "data": vals}],
+                        "ratings": ratings_row,
+                        "series": [{"name": "综合评分", "data": rank_items}],
                     }
                 # Build comparison radar from deterministic scoring dimensions.
                 radar_indicators = [
@@ -355,11 +399,24 @@ class ResponseComposer:
                         charts["scatter"] = {"series": [{"name": "企业风险收益分布", "data": scatter_points}]}
             if charts.get("chart_type") == "analysis":
                 analysis_radar = self._build_radar_from_scoring(enterprises=enterprises, evidence=evidence)
-                if analysis_radar:
-                    charts["radar"] = analysis_radar
+                charts["radar"] = analysis_radar or {}
                 analysis_scatter = self._build_scatter_from_scoring(enterprises=enterprises, evidence=evidence)
-                if analysis_scatter:
-                    charts["scatter"] = analysis_scatter
+                charts["scatter"] = analysis_scatter or {}
+                if len(enterprises) == 1:
+                    gauge_payload = self._build_gauge_from_scoring(enterprises=enterprises, evidence=evidence)
+                    if gauge_payload:
+                        charts["gauge"] = gauge_payload
+            if charts.get("chart_type") == "ranking":
+                rank_bar = self._build_domain_ranking_bar(query=q, enterprises=enterprises, evidence=evidence)
+                if rank_bar:
+                    charts["bar"] = rank_bar
+                else:
+                    charts["bar"] = {"categories": [], "series": []}
+            if charts.get("chart_type") == "legal_risk":
+                legal_stacked = self._build_legal_stacked_from_evidence(enterprises=enterprises, evidence=evidence)
+                legal_heatmap = self._build_legal_heatmap_from_evidence(enterprises=enterprises, evidence=evidence)
+                charts["stacked_bar"] = legal_stacked or {}
+                charts["heatmap"] = legal_heatmap or {}
             if is_comparison_query:
                 snapshot = build_comparison_snapshot_from_evidence(enterprises=enterprises, evidence=evidence)
                 if snapshot:
@@ -503,6 +560,107 @@ class ResponseComposer:
             charts=charts if report else {},
         )
 
+    def _build_gauge_from_scoring(self, enterprises: list[str], evidence: list[Evidence]) -> dict[str, Any] | None:
+        if len(enterprises) != 1:
+            return None
+        target = enterprises[0]
+        for ev in evidence or []:
+            if ev.source != "local_scoring_service":
+                continue
+            try:
+                payload = json.loads(ev.excerpt)
+            except Exception:
+                continue
+            ent_raw = str(payload.get("enterprise") or "")
+            if target not in ent_raw and ent_raw not in target:
+                continue
+            ds = payload.get("deterministic_scoring") if isinstance(payload, dict) else None
+            if not isinstance(ds, dict):
+                continue
+            total = ds.get("total_score")
+            if not isinstance(total, (int, float)):
+                continue
+            rating = ds.get("rating")
+            return {
+                "value": float(total),
+                "rating": str(rating) if rating not in (None, "") else "-",
+                "title": "综合评分",
+            }
+        return None
+
+    def _build_domain_ranking_bar(self, *, query: str, enterprises: list[str], evidence: list[Evidence]) -> dict[str, Any] | None:
+        q = (query or "").lower()
+        rows: list[tuple[str, float, str]] = []
+
+        def _metric_from_ds(ds: dict[str, Any]) -> float | None:
+            if not isinstance(ds, dict):
+                return None
+            dims = ds.get("dimension_scores") if isinstance(ds.get("dimension_scores"), dict) else {}
+
+            def _dim(name: str) -> float | None:
+                raw = dims.get(name)
+                if isinstance(raw, dict):
+                    raw = raw.get("score")
+                return float(raw) if isinstance(raw, (int, float)) else None
+
+            if "roe" in q or "净资产收益率" in q:
+                v = _dim("financial_health")
+                return v
+            if re.search(r"(诉讼|案件|司法)", q):
+                v = _dim("legal_risk")
+                return v
+            ts = ds.get("total_score")
+            return float(ts) if isinstance(ts, (int, float)) else None
+
+        seen: set[str] = set()
+        for ev in evidence or []:
+            if ev.source != "local_scoring_service":
+                continue
+            try:
+                payload = json.loads(ev.excerpt)
+            except Exception:
+                continue
+            ent_raw = str(payload.get("enterprise") or "").strip()
+            if not ent_raw:
+                continue
+            ds = payload.get("deterministic_scoring") if isinstance(payload, dict) else None
+            val = _metric_from_ds(ds) if isinstance(ds, dict) else None
+            if val is None:
+                continue
+            rating = str(ds.get("rating") or "-") if isinstance(ds, dict) else "-"
+            key = ent_raw
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append((ent_raw, float(val), rating))
+
+        if len(rows) < 2:
+            return None
+
+        rows.sort(key=lambda x: x[1], reverse=True)
+        top_n = self._infer_top_n_from_query(q)
+        rows = rows[:top_n]
+        metric_title = "ROE(维度得分)" if ("roe" in q or "净资产收益率" in q) else "法律风险(维度得分)" if re.search(r"(诉讼|案件|司法)", q) else "综合评分"
+        return {
+            "categories": [r[0] for r in rows],
+            "metric_title": metric_title,
+            "series": [{"name": metric_title, "data": [r[1] for r in rows]}],
+            "ratings": [r[2] for r in rows],
+        }
+
+    def _infer_top_n_from_query(self, query: str) -> int:
+        t = (query or "").strip()
+        if re.search(r"(前三|前\s*3)\b", t):
+            return 3
+        if re.search(r"(前五|前\s*5)\b", t):
+            return 5
+        if re.search(r"(前十|前\s*10)\b", t):
+            return 10
+        m = re.search(r"top\s*(\d+)", t, flags=re.IGNORECASE)
+        if m:
+            return max(1, min(int(m.group(1)), 50))
+        return 10
+
     def _extract_enterprise_risk_score(self, enterprise: str, evidence: list[Evidence]) -> float | None:
         for ev in evidence or []:
             if ev.source != "local_scoring_service":
@@ -584,6 +742,181 @@ class ResponseComposer:
             return None
         return {"series": [{"name": "企业风险收益分布", "data": points}]}
 
+    def _build_legal_stacked_from_evidence(self, enterprises: list[str], evidence: list[Evidence]) -> dict[str, Any] | None:
+        year_lawsuits: dict[str, float] = {}
+        year_amounts: dict[str, float] = {}
+        for ev in evidence or []:
+            if ev.source != "local_indicator_engine":
+                continue
+            title = str(ev.title or "")
+            m_year = re.search(r"(20\d{2})", title)
+            year = m_year.group(1) if m_year else "未知"
+            excerpt = str(ev.excerpt or "")
+            m_count = re.search(r"诉讼次数=([-\d.]+)", excerpt)
+            m_amt = re.search(r"涉案金额=([-\d.]+)", excerpt)
+            if m_count:
+                year_lawsuits[year] = year_lawsuits.get(year, 0.0) + float(m_count.group(1))
+            if m_amt:
+                year_amounts[year] = year_amounts.get(year, 0.0) + float(m_amt.group(1))
+        if not year_lawsuits and not year_amounts:
+            return None
+        categories = sorted(set(year_lawsuits.keys()) | set(year_amounts.keys()), key=lambda y: (y == "未知", y))
+        lawsuit_vals = [year_lawsuits.get(y, 0.0) for y in categories]
+        amount_vals = [year_amounts.get(y, 0.0) for y in categories]
+        return {
+            "categories": categories,
+            "series": [
+                {"name": "诉讼次数", "data": lawsuit_vals},
+                {"name": "涉案金额", "data": amount_vals},
+            ],
+        }
+
+    def _build_legal_heatmap_from_evidence(self, enterprises: list[str], evidence: list[Evidence]) -> dict[str, Any] | None:
+        categories: list[str] = []
+        values: list[float] = []
+        for ev in evidence or []:
+            if ev.source != "local_indicator_engine":
+                continue
+            title = str(ev.title or "")
+            m_year = re.search(r"(20\d{2})", title)
+            year = m_year.group(1) if m_year else "未知"
+            excerpt = str(ev.excerpt or "")
+            m_count = re.search(r"诉讼次数=([-\d.]+)", excerpt)
+            val = float(m_count.group(1)) if m_count else 0.0
+            categories.append(year)
+            values.append(val)
+        if not categories:
+            return None
+        return {"categories": categories, "values": values}
+
+    def _build_sentiment_line_from_evidence(self, enterprises: list[str], evidence: list[Evidence]) -> dict[str, Any] | None:
+        points: list[tuple[str, float]] = []
+        for ev in evidence or []:
+            if ev.source != "local_scoring_service":
+                continue
+            try:
+                payload = json.loads(ev.excerpt)
+            except Exception:
+                continue
+            year = str(payload.get("year") or "")
+            ds = payload.get("deterministic_scoring") if isinstance(payload, dict) else None
+            dims = ds.get("dimension_scores") if isinstance(ds, dict) else None
+            if not isinstance(dims, dict):
+                continue
+            risk = dims.get("legal_risk")
+            if isinstance(risk, dict):
+                risk = risk.get("score")
+            if year and isinstance(risk, (int, float)):
+                points.append((year, float(risk)))
+        if not points:
+            return None
+        points.sort(key=lambda x: x[0])
+        return {
+            "categories": [x[0] for x in points],
+            "series": [{"name": "舆情热度", "data": [x[1] for x in points]}],
+        }
+
+
+def _excerpt_metric(ex: str, label: str) -> str | None:
+    m = re.search(rf"{re.escape(label)}=([^,;，。\s]+)", ex)
+    return m.group(1).strip() if m else None
+
+
+def _try_parse_number(token: str | None) -> float | None:
+    if token is None:
+        return None
+    t = str(token).strip().replace(",", "")
+    if not t or t.upper() in {"N/A", "NONE", "NULL", "-"}:
+        return None
+    try:
+        return float(t.replace("%", ""))
+    except ValueError:
+        return None
+
+
+def _format_money_cn(v: float) -> str:
+    av = abs(v)
+    if av >= 1e8:
+        return f"{v / 1e8:.2f}亿元"
+    if av >= 1e4:
+        return f"{v / 1e4:.2f}万元"
+    return f"{v:,.2f}元"
+
+
+def _offline_append_metrics_from_evidence(
+    *, query: str, enterprises: list[str], years: list[int], evidence: list[Evidence]
+) -> str:
+    """多指标问法在离线模式下，从 local_indicator_engine 摘录中拼出可读数值（尽量覆盖问句中的各指标）。"""
+    q = (query or "").strip()
+    if not evidence or not q:
+        return ""
+    if not IntentDetector()._contains_multiple_metrics(q):
+        return ""
+
+    want_sv = bool(re.search(r"(销量|销售)", q))
+    want_np = "净利润" in q or "净利率" in q
+    want_rev = bool(re.search(r"(营收|营业收入|总收入)", q))
+    want_roe = bool(re.search(r"(ROE|roe|净资产收益率)", q))
+    want_cr = "流动比率" in q or "速动比率" in q
+    want_assets = "总资产" in q
+
+    tgt_years = set(int(y) for y in years) if years else set()
+    parts: list[str] = []
+    for e in evidence:
+        if e.source != "local_indicator_engine":
+            continue
+        title = e.title or ""
+        my = re.search(r"(20\d{2})", title)
+        if not my:
+            continue
+        y = int(my.group(1))
+        if tgt_years and y not in tgt_years:
+            continue
+        ex = e.excerpt or ""
+        snip: list[str] = []
+
+        if want_sv:
+            sv_t = _excerpt_metric(ex, "销量")
+            nev_n = _try_parse_number(_excerpt_metric(ex, "新能源销量"))
+            sv_n = _try_parse_number(sv_t)
+            if sv_t is not None:
+                if sv_n == 0 and nev_n and nev_n > 0:
+                    snip.append(f"总销量在库中为0（可能仅录入了新能源分项；新能源销量约{nev_n:,.0f}辆）")
+                elif sv_n is not None:
+                    snip.append(f"销量约{sv_n:,.0f}辆")
+                else:
+                    snip.append(f"销量={sv_t}")
+        if want_rev:
+            rt = _excerpt_metric(ex, "营收")
+            if rt:
+                rn = _try_parse_number(rt)
+                snip.append(f"营收约{_format_money_cn(rn)}" if rn is not None else f"营收={rt}")
+        if want_np:
+            nt = _excerpt_metric(ex, "净利润")
+            if nt:
+                nn = _try_parse_number(nt)
+                snip.append(f"净利润约{_format_money_cn(nn)}" if nn is not None else f"净利润={nt}")
+        if want_roe:
+            rt = _excerpt_metric(ex, "ROE")
+            if rt:
+                snip.append(f"ROE={rt}")
+        if want_cr:
+            ct = _excerpt_metric(ex, "流动比率")
+            if ct:
+                snip.append(f"流动比率={ct}")
+        if want_assets:
+            at = _excerpt_metric(ex, "总资产")
+            if at:
+                an = _try_parse_number(at)
+                snip.append(f"总资产约{_format_money_cn(an)}" if an is not None else f"总资产={at}")
+
+        if snip:
+            parts.append(f"{y}年" + "，".join(snip))
+    if not parts:
+        return ""
+    head = "、".join(enterprises) if enterprises else "目标企业"
+    return f" {head}多指标摘要：" + "；".join(parts) + "。"
+
 
 def offline_report_from_evidence(*, intent: str, query: str, enterprises: list[str], years: list[int], evidence: list[Evidence]) -> EnhancedReport:
     key = "、".join(enterprises) if enterprises else "（未识别企业）"
@@ -598,6 +931,7 @@ def offline_report_from_evidence(*, intent: str, query: str, enterprises: list[s
         kb_note = "知识库中未找到直接相关信息（离线模板占位提示）。"
         kb_attr = "无 knowledge_base 归因（离线模板占位提示）。"
     summary = f"已基于本地数据完成{key}在{time_desc}的{intent}分析。证据条数={len(evidence)}。"
+    summary += _offline_append_metrics_from_evidence(query=query, enterprises=enterprises, years=years, evidence=evidence)
     return EnhancedReport(
         summary=summary,
         evidence_trail=[

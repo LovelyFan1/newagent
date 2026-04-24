@@ -168,9 +168,15 @@
     });
   };
 
-  ApiClient.prototype.uploadFile = function (file) {
+  ApiClient.prototype.uploadFile = function (file, sessionId) {
     if (!file) return Promise.reject(new Error('未选择文件'));
-    return Promise.reject(new Error('当前后端未开放文件上传接口'));
+    var form = new FormData();
+    form.append('file', file);
+    if (sessionId) form.append('session_id', sessionId);
+    return this._request('/api/v1/files/upload', {
+      method: 'POST',
+      body: form,
+    });
   };
 
   window.ApiClient = ApiClient;

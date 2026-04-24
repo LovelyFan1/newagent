@@ -2,3 +2,6 @@
 __pycache__/
 .pytest_cache/
 *.pyc
+test_local.db
+web_modified_backup/
+data/cleaned_broken_backup/

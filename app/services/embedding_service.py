@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 import hashlib
 import os
 from typing import List
@@ -14,6 +15,37 @@ class EmbeddingService:
         self.dimension = int(os.environ.get("EMBEDDING_DIM", "1536"))
         api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("LLM_API_KEY")
         self._client = AsyncOpenAI(api_key=api_key) if api_key else None
+        self._cache_maxsize = int(os.environ.get("EMBEDDING_CACHE_MAXSIZE", "1000"))
+        self._cache: OrderedDict[str, List[float]] = OrderedDict()
+        self._cache_lock = asyncio.Lock()
+
+    def _cache_key(self, text: str) -> str:
+        raw = f"{self.model}|{self.dimension}|{text or ''}".encode("utf-8")
+        return hashlib.md5(raw).hexdigest()
+
+    async def _cache_get_many(self, keys: list[str]) -> dict[str, List[float]]:
+        if not keys:
+            return {}
+        async with self._cache_lock:
+            out: dict[str, List[float]] = {}
+            for k in keys:
+                v = self._cache.get(k)
+                if v is not None:
+                    # refresh LRU order
+                    self._cache.move_to_end(k, last=True)
+                    out[k] = v
+            return out
+
+    async def _cache_put_many(self, items: list[tuple[str, List[float]]]) -> None:
+        if not items:
+            return
+        async with self._cache_lock:
+            for k, v in items:
+                self._cache[k] = v
+                self._cache.move_to_end(k, last=True)
+            # evict oldest
+            while self._cache_maxsize > 0 and len(self._cache) > self._cache_maxsize:
+                self._cache.popitem(last=False)
 
     async def embed(self, texts: List[str]) -> List[List[float]]:
         if not texts:
@@ -21,12 +53,26 @@ class EmbeddingService:
         if self._client is None:
             return [self._hash_embedding(t) for t in texts]
 
-        # batch call
+        keys = [self._cache_key(t) for t in texts]
+        cached = await self._cache_get_many(keys)
+
+        missing_texts: list[str] = []
+        missing_keys: list[str] = []
+        for t, k in zip(texts, keys):
+            if k not in cached:
+                missing_texts.append(t)
+                missing_keys.append(k)
+
+        # batch call for misses only
         try:
-            resp = await self._client.embeddings.create(model=self.model, input=texts)
-            vectors = [list(item.embedding) for item in resp.data]
-            # normalize dimension in case model dimension differs from config
-            return [self._fit_dim(v) for v in vectors]
+            if missing_texts:
+                resp = await self._client.embeddings.create(model=self.model, input=missing_texts)
+                vectors = [self._fit_dim(list(item.embedding)) for item in resp.data]
+                await self._cache_put_many(list(zip(missing_keys, vectors)))
+
+            # restore original order
+            cached2 = await self._cache_get_many(keys)
+            return [cached2[k] for k in keys]
         except Exception:
             # offline degrade
             return [self._hash_embedding(t) for t in texts]

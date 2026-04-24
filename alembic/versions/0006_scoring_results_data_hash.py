@@ -3,7 +3,6 @@
 Revision ID: 0006_scoring_results_data_hash
 Revises: 0005_documents_hash
 Create Date: 2026-04-22
-
 """
 
 from __future__ import annotations
@@ -25,4 +24,3 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.execute("DROP INDEX IF EXISTS ix_scoring_results_data_hash;")
     op.execute("ALTER TABLE public.scoring_results DROP COLUMN IF EXISTS data_hash;")
-
